@@ -111,13 +111,20 @@ QUERIES = {
                c.lane2_enabled AS lane2_enabled
     """,
 
+    # Conviction tier distribution.
+    #
+    # Neo4j 5.x rejects the inline expression `(count(t) * 1.0 / total) * 100`
+    # in RETURN: it mixes the aggregation count(t) with the non-aggregated
+    # scalar `total` from a preceding WITH inside a single expression
+    # ("Aggregation column contains implicit grouping expressions", gql 42001).
+    # Fix: extract count(t) into a preceding WITH so RETURN does pure scalar
+    # arithmetic on already-resolved variables.
     "conviction_tiers": """
         MATCH (t:TradeNode)
         WITH count(t) AS total
         MATCH (t:TradeNode)
-        RETURN t.conviction_tier AS tier,
-               count(t) AS tier_count,
-               (count(t) * 1.0 / total) * 100 AS tier_pct
+        WITH total, t.conviction_tier AS tier, count(t) AS tier_count
+        RETURN tier, tier_count, (tier_count * 1.0 / total) * 100 AS tier_pct
     """,
 
     "kernel_nodes": """
