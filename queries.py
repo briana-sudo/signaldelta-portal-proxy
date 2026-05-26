@@ -260,6 +260,60 @@ QUERIES = {
                p.lane2_confidence AS lane2_confidence,
                p.status AS prediction_status
     """,
+
+    # ── Diagnostics — equity drift anomaly verification (2026-05-26) ──
+    # Read-only Cypher matching the operator's Q1-Q5 verbatim. KCCNode
+    # exclusion is preserved to filter out the other-namespace nodes that
+    # share label vocabulary with the engine. These remain in the whitelist
+    # past the immediate verification — they're useful general health checks
+    # for the engine's TradeNode / EquitySnapshotNode / CapitalFlowNode state.
+
+    "diag_trade_counts": """
+        MATCH (t:TradeNode)
+        WHERE NOT t:KCCNode
+        RETURN count(t) AS total_trades,
+               sum(CASE WHEN t.status = 'OPEN' THEN 1 ELSE 0 END) AS open_count,
+               sum(CASE WHEN t.status = 'CLOSED' THEN 1 ELSE 0 END) AS closed_count
+    """,
+
+    "diag_realized_pnl": """
+        MATCH (t:TradeNode)
+        WHERE NOT t:KCCNode AND t.status = 'CLOSED'
+        RETURN sum(coalesce(t.realized_pnl, 0)) AS total_realized_pnl,
+               collect(t.realized_pnl)[..20] AS pnl_sample
+    """,
+
+    "diag_equity_snapshots": """
+        MATCH (e:EquitySnapshotNode)
+        WHERE NOT e:KCCNode
+        RETURN e.snapshot_date AS snapshot_date,
+               e.equity AS equity,
+               e.realized_pnl AS realized_pnl,
+               e.unrealized_pnl AS unrealized_pnl
+        ORDER BY e.snapshot_date DESC
+        LIMIT 5
+    """,
+
+    "diag_capital_flows": """
+        MATCH (c:CapitalFlowNode)
+        WHERE NOT c:KCCNode
+        RETURN c.flow_type AS flow_type,
+               c.amount AS amount,
+               c.timestamp AS timestamp
+        ORDER BY c.timestamp DESC
+        LIMIT 10
+    """,
+
+    "diag_equity_nodes": """
+        MATCH (a)
+        WHERE a.account_equity IS NOT NULL OR a.equity IS NOT NULL
+        RETURN labels(a) AS node_labels,
+               a.account_equity AS account_equity,
+               a.equity AS equity,
+               coalesce(a.timestamp, a.created_timestamp, a.snapshot_date) AS ts
+        ORDER BY ts DESC
+        LIMIT 10
+    """,
 }
 
 # Per-query expected parameter keys (for input validation).
@@ -285,6 +339,11 @@ REQUIRED_PARAMS = {
     "rules_footer": [],
     "monitored_assets": [],
     "trade_overlay_enrichment": ["request_id"],
+    "diag_trade_counts": [],
+    "diag_realized_pnl": [],
+    "diag_equity_snapshots": [],
+    "diag_capital_flows": [],
+    "diag_equity_nodes": [],
 }
 
 # Sanity check at import time.
