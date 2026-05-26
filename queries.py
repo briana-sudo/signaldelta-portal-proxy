@@ -314,6 +314,37 @@ QUERIES = {
         ORDER BY ts DESC
         LIMIT 10
     """,
+
+    # ── Engine heartbeat (reconciliation Section K dispatch) ──
+    # Single timestamp answering "when did the engine last write anything?"
+    # CALL/UNION ALL over the 6 node types the engine writes most frequently
+    # per the operator's spec. Each branch computes its own max with a coalesce
+    # over plausible timestamp field names so a renamed field doesn't silently
+    # zero out one branch. Outer max() aggregates across branches.
+    # Drives the LIVE / STALE / STOPPED state pill in the portal header
+    # (thresholds 7min / 30min computed client-side in adaptHeartbeat).
+    "engine_heartbeat": """
+        CALL {
+          MATCH (t:TradeNode)
+          RETURN max(coalesce(t.exit_timestamp, t.entry_timestamp)) AS ts
+          UNION ALL
+          MATCH (e:SystemEventNode)
+          RETURN max(e.timestamp) AS ts
+          UNION ALL
+          MATCH (es:EquitySnapshotNode)
+          RETURN max(coalesce(es.sync_timestamp, es.created_timestamp)) AS ts
+          UNION ALL
+          MATCH (a:Layer1AnomalyNode)
+          RETURN max(coalesce(a.created_timestamp, a.timestamp)) AS ts
+          UNION ALL
+          MATCH (r:TradingRuleNode)
+          RETURN max(r.created_timestamp) AS ts
+          UNION ALL
+          MATCH (p:PredictionNode)
+          RETURN max(coalesce(p.created_timestamp, p.prediction_timestamp)) AS ts
+        }
+        RETURN max(ts) AS last_engine_write
+    """,
 }
 
 # Per-query expected parameter keys (for input validation).
@@ -344,6 +375,7 @@ REQUIRED_PARAMS = {
     "diag_equity_snapshots": [],
     "diag_capital_flows": [],
     "diag_equity_nodes": [],
+    "engine_heartbeat": [],
 }
 
 # Sanity check at import time.
