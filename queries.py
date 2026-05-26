@@ -3,31 +3,46 @@ Cypher whitelist for the SignalDelta portal proxy.
 
 Portal callers POST {"name": "<query_name>", "params": {...}} to /query. The
 proxy looks up the Cypher string here by name. Portal can never inject
-arbitrary Cypher — only the 20 pre-authored named queries below are callable.
+arbitrary Cypher — only the pre-authored named queries below are callable.
+
+Per Brian's "proxy is portal-only" rule, this whitelist holds queries the
+PORTAL needs to render. Engine-side audits go direct via the neo4j driver.
 
 Sources:
   - Original reconciliation §Panel-by-Panel + §Consolidated 60-Second Poll
   - Reconciliation v1.1+ Section D (D1 Equity Curve, D2 Returns Matrix, D3 Rules)
-  - Section H punchlist fields (TradeNode.asset_class, TradeNode.phase,
-    EquitySnapshotNode TWR/PEAK/DD) written against documented field names;
-    queries return empty until §14 / §17 amendments land. Portal's bootstrap-
-    state pattern covers the gap automatically on the next poll.
+  - Portal v1.1 dispatch 2026-05-26 (Changes 1-3): pre-market cutoff filter,
+    trade list, news ticker
 
-Phase filter (Section E mode toggle): not applied here in Phase 1.1 since
-TradeNode.phase isn't yet a §14 field. When it lands, append the WHERE clause
-inside execute_query() in main.py based on a `mode` param from the request.
+Cutoff filter (portal v1.1 Change 1):
+  PORTAL_TRADE_CUTOFF_ISO is auto-injected by main.run_query() into the $cutoff
+  param of any query whose name appears in CUTOFF_QUERIES. Queries use
+  `datetime(t.entry_timestamp) >= datetime($cutoff)` (cast both sides to
+  DateTime to avoid the Z-vs-+00:00 lexicographic-string-compare trap).
+  EquitySnapshotNode filters extract the date portion via
+  `date(substring($cutoff, 0, 10))`.
 """
 
+# Pre-market trade cutoff per Portal v1.1 Change 1. Engine launched at this
+# UTC instant on 2026-05-26 (US market open 13:30 UTC); trades fired before
+# this point are pre-launch test fires and skew portal metrics. Graph itself
+# is unchanged — filter is read-only at the proxy boundary.
+PORTAL_TRADE_CUTOFF_ISO = "2026-05-26T13:30:00Z"
+
+
 QUERIES = {
-    # ── Panel-by-panel set (10) ───────────────────────────────────────────
+    # ── Account bar (Change 1: t_all + t_open both cutoff-filtered) ───────
     "account_bar": """
         MATCH (c:TradingConfigNode)
         WITH c.paper_starting_capital AS capital_base, c.current_phase AS current_phase
         OPTIONAL MATCH (e:EquitySnapshotNode)
+        WHERE date(e.snapshot_date) >= date(substring($cutoff, 0, 10))
         WITH capital_base, current_phase, e ORDER BY e.snapshot_date DESC LIMIT 1
         OPTIONAL MATCH (t_all:TradeNode)
+        WHERE datetime(t_all.entry_timestamp) >= datetime($cutoff)
         WITH capital_base, current_phase, e, count(t_all) AS trade_count
         OPTIONAL MATCH (t_open:TradeNode {status: 'OPEN'})
+        WHERE datetime(t_open.entry_timestamp) >= datetime($cutoff)
         RETURN capital_base,
                current_phase,
                e.equity_total AS current_value,
@@ -46,8 +61,11 @@ QUERIES = {
         LIMIT 6
     """,
 
+    # Open-positions query retained for any caller still referencing it.
+    # Portal v1.1 Change 2 switches the panel to `trade_list_recent` (below).
     "open_positions": """
         MATCH (t:TradeNode {status: 'OPEN'})
+        WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
         RETURN t.request_id AS request_id,
                t.asset AS asset,
                t.track AS track,
@@ -59,6 +77,33 @@ QUERIES = {
                t.entry_timestamp AS entry_timestamp
         ORDER BY t.entry_timestamp DESC
         LIMIT 3
+    """,
+
+    # ── Portal v1.1 Change 2: trade list (both OPEN and CLOSED) ───────────
+    "trade_list_recent": """
+        MATCH (t:TradeNode)
+        WHERE NOT t:KCCNode AND NOT t:KTMNode
+          AND datetime(t.entry_timestamp) >= datetime($cutoff)
+        RETURN t.request_id AS request_id,
+               t.asset AS asset,
+               t.track AS track,
+               t.conviction_tier AS conviction,
+               t.entry_price AS entry_price,
+               t.exit_price AS exit_price,
+               t.stop_loss_price AS stop_price,
+               t.target_price AS target_price,
+               t.direction AS direction,
+               t.entry_timestamp AS entry_timestamp,
+               t.exit_timestamp AS exit_timestamp,
+               t.status AS status,
+               t.pnl_dollar AS pnl_dollar,
+               t.pnl_percent AS pnl_percent,
+               t.realized_pnl AS realized_pnl,
+               t.win_loss AS win_loss,
+               t.hold_duration_min AS hold_duration_min,
+               t.exit_reason AS exit_reason
+        ORDER BY t.entry_timestamp DESC
+        LIMIT 12
     """,
 
     "recent_events": """
@@ -75,8 +120,10 @@ QUERIES = {
         LIMIT 12
     """,
 
+    # ── Win rate (Change 1: cutoff applied to CLOSED trades) ──────────────
     "win_rate": """
         MATCH (t:TradeNode {status: 'CLOSED'})
+        WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
         RETURN count(t) AS total_closed,
                sum(CASE WHEN t.win_loss = 'Win' THEN 1 ELSE 0 END) AS wins,
                avg(CASE WHEN t.win_loss = 'Win' THEN 1.0 ELSE 0.0 END) * 100 AS win_rate_pct
@@ -93,8 +140,11 @@ QUERIES = {
         LIMIT 1
     """,
 
+    # ── Lane 2 Δ (Change 1: cutoff applied to CLOSED trades; PredictionNode
+    # filter is by status only, unchanged) ────────────────────────────────
     "lane2_delta": """
         MATCH (t:TradeNode {status: 'CLOSED'})
+        WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
         WITH count(t) AS closed_count,
              avg(CASE WHEN t.win_loss = 'Win' THEN 1.0 ELSE 0.0 END) AS l1_rate
         OPTIONAL MATCH (p:PredictionNode)
@@ -111,18 +161,13 @@ QUERIES = {
                c.lane2_enabled AS lane2_enabled
     """,
 
-    # Conviction tier distribution.
-    #
-    # Neo4j 5.x rejects the inline expression `(count(t) * 1.0 / total) * 100`
-    # in RETURN: it mixes the aggregation count(t) with the non-aggregated
-    # scalar `total` from a preceding WITH inside a single expression
-    # ("Aggregation column contains implicit grouping expressions", gql 42001).
-    # Fix: extract count(t) into a preceding WITH so RETURN does pure scalar
-    # arithmetic on already-resolved variables.
+    # ── Conviction tiers (Change 1: cutoff applied to all TradeNodes) ─────
     "conviction_tiers": """
         MATCH (t:TradeNode)
+        WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
         WITH count(t) AS total
         MATCH (t:TradeNode)
+        WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
         WITH total, t.conviction_tier AS tier, count(t) AS tier_count
         RETURN tier, tier_count, (tier_count * 1.0 / total) * 100 AS tier_pct
     """,
@@ -147,10 +192,10 @@ QUERIES = {
                r.count AS edge_count
     """,
 
-    # ── Section D1: Equity Curve ──────────────────────────────────────────
+    # ── Equity curve (Change 1: cutoff applied — engine launch date) ──────
     "equity_curve_series": """
         MATCH (e:EquitySnapshotNode)
-        WHERE e.snapshot_date >= date() - duration({days: 60})
+        WHERE date(e.snapshot_date) >= date(substring($cutoff, 0, 10))
         RETURN e.snapshot_date AS snapshot_date,
                e.equity_total AS equity
         ORDER BY e.snapshot_date ASC
@@ -158,6 +203,7 @@ QUERIES = {
 
     "equity_curve_stats": """
         MATCH (e:EquitySnapshotNode)
+        WHERE date(e.snapshot_date) >= date(substring($cutoff, 0, 10))
         RETURN e.peak_equity_to_date AS peak,
                e.max_drawdown_to_date_percent AS drawdown_pct,
                e.twr_to_date_percent AS twr_pct,
@@ -166,11 +212,11 @@ QUERIES = {
         LIMIT 1
     """,
 
-    # ── Section D2: Returns by Domain matrix ──────────────────────────────
-    # Cell — full filter (asset_class × track)
+    # ── Returns matrix (Change 1: cutoff applied to every cell + sigma) ───
     "returns_matrix_cell": """
         MATCH (t:TradeNode {status: 'CLOSED'})
-        WHERE t.asset_class = $asset_class
+        WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND t.asset_class = $asset_class
           AND t.track = $track
         WITH count(t) AS total,
              sum(CASE WHEN t.win_loss = 'Win' THEN 1 ELSE 0 END) AS wins,
@@ -178,36 +224,35 @@ QUERIES = {
         RETURN total, wins, returns
     """,
 
-    # Σ row — per-track aggregation across all asset classes (drop asset_class filter)
     "returns_matrix_sigma_row": """
         MATCH (t:TradeNode {status: 'CLOSED'})
-        WHERE t.track = $track
+        WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND t.track = $track
         WITH count(t) AS total,
              sum(CASE WHEN t.win_loss = 'Win' THEN 1 ELSE 0 END) AS wins,
              collect(t.pnl_percent) AS returns
         RETURN total, wins, returns
     """,
 
-    # Σ column — per-asset-class aggregation across all tracks (drop track filter)
     "returns_matrix_sigma_col": """
         MATCH (t:TradeNode {status: 'CLOSED'})
-        WHERE t.asset_class = $asset_class
+        WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND t.asset_class = $asset_class
         WITH count(t) AS total,
              sum(CASE WHEN t.win_loss = 'Win' THEN 1 ELSE 0 END) AS wins,
              collect(t.pnl_percent) AS returns
         RETURN total, wins, returns
     """,
 
-    # Σ corner — system-wide TOTAL (drop both filters)
     "returns_matrix_sigma_corner": """
         MATCH (t:TradeNode {status: 'CLOSED'})
+        WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
         WITH count(t) AS total,
              sum(CASE WHEN t.win_loss = 'Win' THEN 1 ELSE 0 END) AS wins,
              collect(t.pnl_percent) AS returns
         RETURN total, wins, returns
     """,
 
-    # ── Section D3: Rules Added This Week ─────────────────────────────────
     "rules_this_week": """
         MATCH (r:TradingRuleNode)
         WHERE r.created_timestamp >= date.truncate('week', date())
@@ -229,7 +274,6 @@ QUERIES = {
         RETURN total, latest_cycle, count(r2) AS this_week_count
     """,
 
-    # ── Mount-time + per-event ────────────────────────────────────────────
     "monitored_assets": """
         MATCH (c:TradingConfigNode)
         RETURN c.monitored_assets AS asset_list
@@ -261,13 +305,7 @@ QUERIES = {
                p.status AS prediction_status
     """,
 
-    # ── Diagnostics — equity drift anomaly verification (2026-05-26) ──
-    # Read-only Cypher matching the operator's Q1-Q5 verbatim. KCCNode
-    # exclusion is preserved to filter out the other-namespace nodes that
-    # share label vocabulary with the engine. These remain in the whitelist
-    # past the immediate verification — they're useful general health checks
-    # for the engine's TradeNode / EquitySnapshotNode / CapitalFlowNode state.
-
+    # ── Diagnostics — 2026-05-26 equity drift audit, kept long-term ──────
     "diag_trade_counts": """
         MATCH (t:TradeNode)
         WHERE NOT t:KCCNode
@@ -315,53 +353,7 @@ QUERIES = {
         LIMIT 10
     """,
 
-    # ── News scan frequency audit (2026-05-18) ──
-    # Read-only diagnostics empirically verifying §9's twice-daily cadence
-    # against the actual NewsContextNode + Layer9AnomalyNode rows the engine
-    # writes. §9 emits no SystemEventNode by design (see news_scan_audit.md).
-    # KCCNode exclusion preserved.
-
-    "diag_news_context_by_day": """
-        MATCH (n:NewsContextNode)
-        WHERE NOT n:KCCNode
-          AND n.date >= date() - duration({days: 7})
-        RETURN n.date AS scan_date,
-               count(n) AS context_count,
-               min(n.written_at) AS first_write_utc,
-               max(n.written_at) AS last_write_utc
-        ORDER BY scan_date DESC
-    """,
-
-    "diag_news_anomalies_by_day": """
-        MATCH (a:Layer9AnomalyNode)
-        WHERE NOT a:KCCNode
-          AND datetime(a.created_timestamp) >= datetime() - duration({days: 7})
-        RETURN substring(a.created_timestamp, 0, 10) AS day,
-               a.anomaly_type AS anomaly_type,
-               count(*) AS count
-        ORDER BY day DESC, count DESC
-    """,
-
-    "diag_news_write_windows": """
-        MATCH (n:NewsContextNode)
-        WHERE NOT n:KCCNode
-          AND n.date >= date() - duration({days: 7})
-        WITH n.date AS scan_date,
-             datetime(n.written_at).hour AS write_hour,
-             count(n) AS assets_in_bucket
-        RETURN scan_date,
-               collect({hour_utc: write_hour, count: assets_in_bucket}) AS run_windows
-        ORDER BY scan_date DESC
-    """,
-
-    # ── Engine heartbeat (reconciliation Section K dispatch) ──
-    # Single timestamp answering "when did the engine last write anything?"
-    # CALL/UNION ALL over the 6 node types the engine writes most frequently
-    # per the operator's spec. Each branch computes its own max with a coalesce
-    # over plausible timestamp field names so a renamed field doesn't silently
-    # zero out one branch. Outer max() aggregates across branches.
-    # Drives the LIVE / STALE / STOPPED state pill in the portal header
-    # (thresholds 7min / 30min computed client-side in adaptHeartbeat).
+    # ── Engine heartbeat ─────────────────────────────────────────────────
     "engine_heartbeat": """
         CALL {
           MATCH (t:TradeNode)
@@ -384,14 +376,51 @@ QUERIES = {
         }
         RETURN max(ts) AS last_engine_write
     """,
+
+    # ── Portal v1.1 Change 3A: News ticker — non-QUIET NewsContextNodes ──
+    "news_ticker_recent": """
+        MATCH (n:NewsContextNode)
+        WHERE NOT n:KCCNode AND NOT n:KTMNode
+          AND n.event_type <> 'QUIET'
+        RETURN n.asset AS asset,
+               n.event_type AS event_type,
+               n.impact_level AS impact_level,
+               n.event_summary AS event_summary,
+               n.source AS source,
+               n.written_at AS written_at,
+               n.date AS scan_date
+        ORDER BY n.written_at DESC
+        LIMIT 50
+    """,
 }
 
+
+# Queries into which main.run_query() auto-injects PORTAL_TRADE_CUTOFF_ISO
+# as $cutoff. Listed explicitly so the auto-inject is a deliberate opt-in,
+# not a side-effect of every Cypher containing the literal string $cutoff.
+CUTOFF_QUERIES = frozenset({
+    "account_bar",
+    "open_positions",
+    "trade_list_recent",
+    "win_rate",
+    "lane2_delta",
+    "conviction_tiers",
+    "equity_curve_series",
+    "equity_curve_stats",
+    "returns_matrix_cell",
+    "returns_matrix_sigma_row",
+    "returns_matrix_sigma_col",
+    "returns_matrix_sigma_corner",
+})
+
+
 # Per-query expected parameter keys (for input validation).
-# Empty list = no params required.
+# `cutoff` is NOT listed — it's auto-injected by main.py for CUTOFF_QUERIES.
 REQUIRED_PARAMS = {
     "account_bar": [],
     "weekly_waterfall": [],
     "open_positions": [],
+    "trade_list_recent": [],
     "recent_events": [],
     "win_rate": [],
     "sharpe_ratio": [],
@@ -415,11 +444,8 @@ REQUIRED_PARAMS = {
     "diag_capital_flows": [],
     "diag_equity_nodes": [],
     "engine_heartbeat": [],
-    "diag_news_context_by_day": [],
-    "diag_news_anomalies_by_day": [],
-    "diag_news_write_windows": [],
+    "news_ticker_recent": [],
 }
 
-# Sanity check at import time.
 assert set(QUERIES.keys()) == set(REQUIRED_PARAMS.keys()), \
     "QUERIES and REQUIRED_PARAMS must have identical keys"
