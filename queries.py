@@ -106,9 +106,14 @@ QUERIES = {
         LIMIT 12
     """,
 
+    # Portal v1.1 dispatch 2026-05-26 (status-strip 5-event cycle): dropped
+    # the 30-min lookback so the strip always shows the 5 most recent events
+    # regardless of age. KCC/KTM isolation added for branch consistency.
+    # LIMIT stays at 12 — portal slices [0..5] for the cycle; the extra rows
+    # are a cheap headroom for any future consumer wanting more depth.
     "recent_events": """
         MATCH (e:SystemEventNode)
-        WHERE e.timestamp >= datetime() - duration('PT30M')
+        WHERE NOT e:KCCNode AND NOT e:KTMNode
         RETURN e.event_id AS event_id,
                e.event_type AS event_type,
                e.event_subtype AS event_subtype,
