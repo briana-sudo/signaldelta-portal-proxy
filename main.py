@@ -45,6 +45,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from neo4j import GraphDatabase, time as neo4j_time
 from pydantic import BaseModel, Field
 
@@ -56,9 +57,13 @@ PROXY_API_TOKEN = os.environ.get("PROXY_API_TOKEN")
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD")
-# Engine uses lower- or upper-case; accept either, prefer the documented form.
+# Accept three name variants (underscore / no-underscore / lowercase) so the
+# proxy reads the key regardless of which convention the operator's .env uses.
+# Engine's .env uses ALPHA_VANTAGE_API_KEY; the operator could plausibly type
+# ALPHAVANTAGE_API_KEY (no underscore) — accept both.
 ALPHA_VANTAGE_API_KEY = (
     os.environ.get("ALPHA_VANTAGE_API_KEY")
+    or os.environ.get("ALPHAVANTAGE_API_KEY")
     or os.environ.get("alpha_vantage_api_key")
 )
 
@@ -70,7 +75,10 @@ if not NEO4J_PASSWORD:
     raise RuntimeError("NEO4J_PASSWORD env var missing. Set it in your .env file.")
 if not ALPHA_VANTAGE_API_KEY:
     print(
-        "[proxy] WARNING: ALPHA_VANTAGE_API_KEY not set — /macro_news will return 503.",
+        "[proxy] WARNING: ALPHA_VANTAGE_API_KEY not set in .env (checked "
+        "ALPHA_VANTAGE_API_KEY / ALPHAVANTAGE_API_KEY / alpha_vantage_api_key). "
+        "/macro_news will return 503 until the key is added. Copy "
+        ".env.example to .env and fill in the key, then restart the proxy.",
         file=sys.stderr,
     )
 
@@ -261,9 +269,15 @@ def _is_rate_limit_response(data: dict[str, Any]) -> bool:
 @app.get("/macro_news", dependencies=[Depends(require_bearer)])
 def macro_news():
     if not ALPHA_VANTAGE_API_KEY:
-        raise HTTPException(
+        # Per Portal v1.1 env-loader-fix dispatch: clear error body + stderr
+        # log so the proxy's own log surfaces the actual reason. Portal sees
+        # {error, feed: []} which keeps the MacroNewsStrip's empty path clean
+        # while the operator still gets a banner indicating partial data.
+        msg = "ALPHA_VANTAGE_API_KEY not configured in proxy .env"
+        print(f"[proxy] /macro_news 503: {msg}", file=sys.stderr)
+        return JSONResponse(
             status_code=503,
-            detail="ALPHA_VANTAGE_API_KEY not configured in proxy .env",
+            content={"error": msg, "feed": []},
         )
 
     now_ms = int(_time.time() * 1000)

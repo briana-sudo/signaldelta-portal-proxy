@@ -45,6 +45,7 @@ Local-Neo4j → HTTPS bridge for the SignalDelta portal. The engine writes to lo
 2. Copy `.env.example` → `.env` and fill in real values:
    - `PROXY_API_TOKEN` — paste the 32-character token generated for your install. The same token must be set as `VITE_PROXY_API_TOKEN` on the portal repo's GitHub Secrets.
    - `NEO4J_PASSWORD` — your local Neo4j password.
+   - `ALPHA_VANTAGE_API_KEY` — same key the engine uses for its per-asset news scan (proxy shares the daily quota; combined budget is 25 calls/day on the free tier, well within the 60-min cache TTL on `/macro_news`). Without this key `/macro_news` returns HTTP 503 with `{"error": "ALPHA_VANTAGE_API_KEY not configured in proxy .env", "feed": []}` and stderr logs the reason; the rest of the proxy continues serving Neo4j queries normally.
    - Leave `NEO4J_URI` and `NEO4J_USER` at defaults unless you customized the local install.
 3. Run `start_proxy.bat`. First run creates a `.venv`, installs `fastapi`/`uvicorn`/`neo4j`/`pydantic`/`python-dotenv`, then launches uvicorn on `127.0.0.1:8000`. Subsequent runs reuse the venv and skip pip if already up to date.
 4. In a second terminal, run `start_tunnel.bat`. cloudflared prints a public URL like `https://something-something.trycloudflare.com`. Copy it.
