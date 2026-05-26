@@ -382,6 +382,25 @@ QUERIES = {
         RETURN max(ts) AS last_engine_write
     """,
 
+    # ── Portal v1.2 scanner-cycle dispatch (2026-05-26): most-recent
+    # composite_score per monitored asset, cutoff-filtered. Caller supplies
+    # $asset_list (from a mount-time monitored_assets read). Assets in the
+    # list but with no TradeNode in the cutoff window return zero rows —
+    # the portal renders those as "BUILDING DATA" by diffing against the
+    # cached full asset list. ──────────────────────────────────────────────
+    "scanner_scores": """
+        MATCH (t:TradeNode)
+        WHERE t.asset IN $asset_list
+          AND datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND NOT t:KCCNode AND NOT t:KTMNode
+        WITH t.asset AS asset, t ORDER BY t.entry_timestamp DESC
+        WITH asset, head(collect(t)) AS most_recent
+        RETURN asset,
+               most_recent.composite_score AS last_score,
+               most_recent.track AS last_track,
+               most_recent.entry_timestamp AS last_seen
+    """,
+
     # ── Portal v1.1 Change 3A: News ticker — non-QUIET NewsContextNodes ──
     "news_ticker_recent": """
         MATCH (n:NewsContextNode)
@@ -416,6 +435,7 @@ CUTOFF_QUERIES = frozenset({
     "returns_matrix_sigma_row",
     "returns_matrix_sigma_col",
     "returns_matrix_sigma_corner",
+    "scanner_scores",
 })
 
 
@@ -450,6 +470,7 @@ REQUIRED_PARAMS = {
     "diag_equity_nodes": [],
     "engine_heartbeat": [],
     "news_ticker_recent": [],
+    "scanner_scores": ["asset_list"],
 }
 
 assert set(QUERIES.keys()) == set(REQUIRED_PARAMS.keys()), \
