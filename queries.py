@@ -315,6 +315,45 @@ QUERIES = {
         LIMIT 10
     """,
 
+    # ── News scan frequency audit (2026-05-18) ──
+    # Read-only diagnostics empirically verifying §9's twice-daily cadence
+    # against the actual NewsContextNode + Layer9AnomalyNode rows the engine
+    # writes. §9 emits no SystemEventNode by design (see news_scan_audit.md).
+    # KCCNode exclusion preserved.
+
+    "diag_news_context_by_day": """
+        MATCH (n:NewsContextNode)
+        WHERE NOT n:KCCNode
+          AND n.date >= date() - duration({days: 7})
+        RETURN n.date AS scan_date,
+               count(n) AS context_count,
+               min(n.written_at) AS first_write_utc,
+               max(n.written_at) AS last_write_utc
+        ORDER BY scan_date DESC
+    """,
+
+    "diag_news_anomalies_by_day": """
+        MATCH (a:Layer9AnomalyNode)
+        WHERE NOT a:KCCNode
+          AND datetime(a.created_timestamp) >= datetime() - duration({days: 7})
+        RETURN substring(a.created_timestamp, 0, 10) AS day,
+               a.anomaly_type AS anomaly_type,
+               count(*) AS count
+        ORDER BY day DESC, count DESC
+    """,
+
+    "diag_news_write_windows": """
+        MATCH (n:NewsContextNode)
+        WHERE NOT n:KCCNode
+          AND n.date >= date() - duration({days: 7})
+        WITH n.date AS scan_date,
+             datetime(n.written_at).hour AS write_hour,
+             count(n) AS assets_in_bucket
+        RETURN scan_date,
+               collect({hour_utc: write_hour, count: assets_in_bucket}) AS run_windows
+        ORDER BY scan_date DESC
+    """,
+
     # ── Engine heartbeat (reconciliation Section K dispatch) ──
     # Single timestamp answering "when did the engine last write anything?"
     # CALL/UNION ALL over the 6 node types the engine writes most frequently
@@ -376,6 +415,9 @@ REQUIRED_PARAMS = {
     "diag_capital_flows": [],
     "diag_equity_nodes": [],
     "engine_heartbeat": [],
+    "diag_news_context_by_day": [],
+    "diag_news_anomalies_by_day": [],
+    "diag_news_write_windows": [],
 }
 
 # Sanity check at import time.
