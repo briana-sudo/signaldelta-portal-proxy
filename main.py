@@ -67,6 +67,21 @@ ALPHA_VANTAGE_API_KEY = (
     or os.environ.get("alpha_vantage_api_key")
 )
 
+# Alpaca credentials for GET /market_calendar (market-status clock dispatch
+# 2026-05-26). Same engine credentials — the engine uses Alpaca for paper
+# execution. ALPACA_API_SECRET is the right name (NOT ALPACA_SECRET_KEY) per
+# the May-2026 401-unauthorized incident memo. Accept both spellings just
+# in case.
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY") or os.environ.get("APCA_API_KEY_ID")
+ALPACA_API_SECRET = (
+    os.environ.get("ALPACA_API_SECRET")
+    or os.environ.get("ALPACA_SECRET_KEY")
+    or os.environ.get("APCA_API_SECRET_KEY")
+)
+# Calendar endpoint is the SAME on paper + live (calendar data is universal).
+# Use paper-api to keep parity with the engine's Phase 1 paper account.
+ALPACA_CALENDAR_BASE = "https://paper-api.alpaca.markets/v2/calendar"
+
 if not PROXY_API_TOKEN:
     raise RuntimeError(
         "PROXY_API_TOKEN env var missing. Copy .env.example to .env and set a value."
@@ -79,6 +94,13 @@ if not ALPHA_VANTAGE_API_KEY:
         "ALPHA_VANTAGE_API_KEY / ALPHAVANTAGE_API_KEY / alpha_vantage_api_key). "
         "/macro_news will return 503 until the key is added. Copy "
         ".env.example to .env and fill in the key, then restart the proxy.",
+        file=sys.stderr,
+    )
+if not (ALPACA_API_KEY and ALPACA_API_SECRET):
+    print(
+        "[proxy] WARNING: ALPACA_API_KEY / ALPACA_API_SECRET not set in .env. "
+        "/market_calendar will fall back to weekday-only (no holiday awareness). "
+        "Set both and restart the proxy to enable the Alpaca calendar feed.",
         file=sys.stderr,
     )
 
@@ -345,4 +367,118 @@ def macro_news():
             "cache": "fresh",
             "age_seconds": 0,
             "fetched_at_ms": now_ms,
+        }
+
+
+# ─── Market status clock dispatch (2026-05-26): GET /market_calendar ──────
+# Returns the next 30 trading sessions from Alpaca's calendar endpoint, with
+# a 24-hour proxy-side cache (the calendar is structurally static intraday —
+# only changes when Alpaca publishes the next year's holiday list). Calendar
+# rows include both regular trading days and the trimmed holiday-aware days
+# (e.g., 1pm ET close on Black Friday). Portal computes OPEN / CLOSED /
+# HOLIDAY state per second client-side from the cached calendar.
+#
+# Failure mode: if Alpaca rejects or times out, return {calendar: null,
+# fallback: true}. The portal then falls back to "9:30-16:00 ET Mon-Fri,
+# no holiday awareness" with a small "calendar unavailable" indicator.
+MARKET_CAL_CACHE: dict[str, Any] = {
+    "data": None,           # list of {date, open, close} dicts
+    "fetched_at_ms": 0,
+    "status": "cold",       # cold | fresh | stale | fallback
+    "last_error": None,
+}
+MARKET_CAL_CACHE_LOCK = Lock()
+MARKET_CAL_CACHE_TTL_MS = 24 * 60 * 60 * 1000   # 24 hours
+
+
+def _fetch_alpaca_calendar() -> list[dict[str, Any]]:
+    """Blocking GET against Alpaca calendar endpoint. Returns parsed list.
+
+    Window: today UTC → today + 30 days. Alpaca's calendar response is a
+    plain JSON array of {date, open, close, session_open, session_close}.
+    Auth via APCA-API-KEY-ID + APCA-API-SECRET-KEY headers per Alpaca docs.
+    """
+    if not (ALPACA_API_KEY and ALPACA_API_SECRET):
+        raise RuntimeError("Alpaca credentials not configured")
+    today = datetime.utcnow().date()
+    end = today.fromordinal(today.toordinal() + 30)
+    params = {"start": today.isoformat(), "end": end.isoformat()}
+    url = f"{ALPACA_CALENDAR_BASE}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "APCA-API-KEY-ID": ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+            "User-Agent": "signaldelta-portal-proxy/0.3",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        body = resp.read().decode("utf-8")
+    parsed = json.loads(body)
+    if not isinstance(parsed, list):
+        raise RuntimeError(f"Alpaca calendar returned non-list: {type(parsed).__name__}")
+    return parsed
+
+
+@app.get("/market_calendar", dependencies=[Depends(require_bearer)])
+def market_calendar():
+    now_ms = int(_time.time() * 1000)
+    with MARKET_CAL_CACHE_LOCK:
+        cache_age_ms = now_ms - MARKET_CAL_CACHE["fetched_at_ms"]
+
+        # Fresh cache window: return without hitting Alpaca.
+        if (
+            MARKET_CAL_CACHE["data"] is not None
+            and cache_age_ms < MARKET_CAL_CACHE_TTL_MS
+            and MARKET_CAL_CACHE["status"] == "fresh"
+        ):
+            return {
+                "calendar": MARKET_CAL_CACHE["data"],
+                "cache": "fresh",
+                "age_seconds": cache_age_ms // 1000,
+                "fetched_at_ms": MARKET_CAL_CACHE["fetched_at_ms"],
+                "fallback": False,
+            }
+
+        # Cache expired/cold OR credentials missing — try a live fetch.
+        try:
+            data = _fetch_alpaca_calendar()
+        except Exception as e:
+            err_msg = str(e)
+            print(f"[proxy] /market_calendar fetch error: {err_msg}", file=sys.stderr)
+            # Serve stale if we have any usable cache.
+            if (
+                MARKET_CAL_CACHE["data"] is not None
+                and cache_age_ms < MARKET_CAL_CACHE_TTL_MS * 7
+            ):
+                return {
+                    "calendar": MARKET_CAL_CACHE["data"],
+                    "cache": "stale",
+                    "age_seconds": cache_age_ms // 1000,
+                    "fetched_at_ms": MARKET_CAL_CACHE["fetched_at_ms"],
+                    "fallback": False,
+                    "warning": f"Alpaca fetch failed; serving stale cache: {err_msg}",
+                }
+            # No cache + can't fetch — portal must use weekday-only fallback.
+            MARKET_CAL_CACHE["last_error"] = err_msg
+            MARKET_CAL_CACHE["status"] = "fallback"
+            return {
+                "calendar": None,
+                "cache": "miss",
+                "age_seconds": 0,
+                "fallback": True,
+                "warning": err_msg,
+            }
+
+        # Healthy response — cache + return.
+        MARKET_CAL_CACHE["data"] = data
+        MARKET_CAL_CACHE["fetched_at_ms"] = now_ms
+        MARKET_CAL_CACHE["status"] = "fresh"
+        MARKET_CAL_CACHE["last_error"] = None
+        return {
+            "calendar": data,
+            "cache": "fresh",
+            "age_seconds": 0,
+            "fetched_at_ms": now_ms,
+            "fallback": False,
         }
