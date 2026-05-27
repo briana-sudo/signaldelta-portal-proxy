@@ -385,20 +385,39 @@ QUERIES = {
     # ── Portal v1.2 scanner-cycle dispatch (2026-05-26): most-recent
     # composite_score per monitored asset, cutoff-filtered. Caller supplies
     # $asset_list (from a mount-time monitored_assets read). Assets in the
-    # list but with no TradeNode in the cutoff window return zero rows —
-    # the portal renders those as "BUILDING DATA" by diffing against the
-    # cached full asset list. ──────────────────────────────────────────────
+    # list with no qualifying event return zero rows — the portal renders
+    # those as "BUILDING DATA" by diffing against the cached asset list.
+    #
+    # SCANNER FILTER FIX (2026-05-27): switched source node from TradeNode
+    # to SystemEventNode {event_type:'THRESHOLD_HIT'}. The TradeNode-based
+    # version excluded 18 of 23 monitored assets because Layer 6 rejects
+    # most of them for MAX_POSITION_CAP_EXCEEDED on the $10K Phase 1
+    # account ($100+ stocks > 50% cap once a few positions are open). The
+    # signal engine IS scoring all 23 — proven by THRESHOLD_HIT events
+    # firing for every monitored asset in-window. THRESHOLD_HIT is the
+    # right source: it fires the moment a composite_score clears any one
+    # of the three track thresholds, BEFORE the L6 sizing gate that drops
+    # most assets from the TradeNode chain.
+    #
+    # composite_score lives inside the summary string, not as a top-level
+    # property. Format is stable: "<ASSET> composite_score=NN.NN cleared
+    # <tracks>" — split on the literal sentinel to extract the float. The
+    # long-term cleanup is an engine-side §14 amendment adding
+    # composite_score as a top-level SystemEventNode property; deferred to
+    # a separate dispatch. last_track also dropped from the return — the
+    # portal's adapter falls back to its existing CRY/STK asset-class
+    # sublabel for non-FIRED rows. ─────────────────────────────────────────
     "scanner_scores": """
-        MATCH (t:TradeNode)
-        WHERE t.asset IN $asset_list
-          AND datetime(t.entry_timestamp) >= datetime($cutoff)
-          AND NOT t:KCCNode AND NOT t:KTMNode
-        WITH t.asset AS asset, t ORDER BY t.entry_timestamp DESC
-        WITH asset, head(collect(t)) AS most_recent
+        MATCH (e:SystemEventNode)
+        WHERE NOT e:KCCNode AND NOT e:KTMNode
+          AND e.event_type = 'THRESHOLD_HIT'
+          AND e.asset IN $asset_list
+          AND datetime(e.timestamp) >= datetime($cutoff)
+        WITH e.asset AS asset, e ORDER BY e.timestamp DESC
+        WITH asset, head(collect(e)) AS most_recent
         RETURN asset,
-               most_recent.composite_score AS last_score,
-               most_recent.track AS last_track,
-               most_recent.entry_timestamp AS last_seen
+               toFloat(split(split(most_recent.summary, 'composite_score=')[1], ' ')[0]) AS last_score,
+               most_recent.timestamp AS last_seen
     """,
 
     # ── Portal v1.1 Change 3A: News ticker — non-QUIET NewsContextNodes ──
