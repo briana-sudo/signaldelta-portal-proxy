@@ -30,6 +30,36 @@ Cutoff filter (portal v1.1 Change 1):
 PORTAL_TRADE_CUTOFF_ISO = "2026-05-26T13:30:00Z"
 
 
+# ── Session 40 forensic exclusion (2026-05-29) ───────────────────────────
+# The two δ-silenced TradeNodes from forensic account PA3TLVP8HK4W must not
+# contaminate portal analytics (win rate, trade count, conviction tiers,
+# returns matrix, trade list). main.run_query() auto-injects the effective
+# list as $forensic_ids into any query named in FORENSIC_QUERIES. Stored as
+# a constant here so the list is amendable in one place if more forensic IDs
+# surface later.
+FORENSIC_EXCLUSION_IDS = ["TS-20260526-0003", "TS-20260526-0008"]
+
+# T3-GATE (Session 40, undecided): toggle to also exclude V14 gate trades.
+# Default false. The V14 gate-trade identification rule is TBD by the
+# operator, so V14_GATE_TRADE_IDS is empty for now — flipping the toggle is
+# currently a no-op (it appends an empty list). When the operator defines
+# the V14 identification rule, populate V14_GATE_TRADE_IDS and the toggle
+# becomes live without any query rewrite.
+PORTAL_EXCLUDE_V14_GATE_TRADES = False
+V14_GATE_TRADE_IDS: list[str] = []
+
+
+def effective_forensic_ids() -> list[str]:
+    """The forensic exclusion list main.py injects as $forensic_ids.
+
+    Base forensic IDs always; V14 gate trades only when the toggle is on
+    (currently a no-op since V14_GATE_TRADE_IDS is empty)."""
+    ids = list(FORENSIC_EXCLUSION_IDS)
+    if PORTAL_EXCLUDE_V14_GATE_TRADES:
+        ids.extend(V14_GATE_TRADE_IDS)
+    return ids
+
+
 QUERIES = {
     # ── Account bar (Change 1: t_all + t_open both cutoff-filtered) ───────
     "account_bar": """
@@ -40,9 +70,11 @@ QUERIES = {
         WITH capital_base, current_phase, e ORDER BY e.snapshot_date DESC LIMIT 1
         OPTIONAL MATCH (t_all:TradeNode)
         WHERE datetime(t_all.entry_timestamp) >= datetime($cutoff)
+          AND NOT t_all.trade_id IN $forensic_ids
         WITH capital_base, current_phase, e, count(t_all) AS trade_count
         OPTIONAL MATCH (t_open:TradeNode {status: 'OPEN'})
         WHERE datetime(t_open.entry_timestamp) >= datetime($cutoff)
+          AND NOT t_open.trade_id IN $forensic_ids
         RETURN capital_base,
                current_phase,
                e.equity_total AS current_value,
@@ -51,6 +83,21 @@ QUERIES = {
                e.sync_timestamp AS last_sync,
                trade_count,
                count(t_open) AS open_count
+    """,
+
+    # ── Session 40 rebuild: latest EquitySnapshotNode regardless of cutoff.
+    # Denominator for the broker-sourced Today P&L: equity_total of the most
+    # recent nightly snapshot (the day's opening baseline). NO cutoff filter —
+    # we want the actual last snapshot even if it predates the portal cutoff,
+    # because it's the baseline the broker equity is measured against. ───────
+    "equity_snapshot_latest": """
+        MATCH (e:EquitySnapshotNode)
+        WHERE NOT e:KCCNode AND NOT e:KTMNode
+        RETURN e.snapshot_date AS snapshot_date,
+               e.equity_total AS equity_total,
+               e.sync_timestamp AS sync_timestamp
+        ORDER BY e.snapshot_date DESC
+        LIMIT 1
     """,
 
     "weekly_waterfall": """
@@ -84,6 +131,7 @@ QUERIES = {
         MATCH (t:TradeNode)
         WHERE NOT t:KCCNode AND NOT t:KTMNode
           AND datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND NOT t.trade_id IN $forensic_ids
         RETURN t.request_id AS request_id,
                t.asset AS asset,
                t.track AS track,
@@ -129,6 +177,7 @@ QUERIES = {
     "win_rate": """
         MATCH (t:TradeNode {status: 'CLOSED'})
         WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND NOT t.trade_id IN $forensic_ids
         RETURN count(t) AS total_closed,
                sum(CASE WHEN t.win_loss = 'Win' THEN 1 ELSE 0 END) AS wins,
                avg(CASE WHEN t.win_loss = 'Win' THEN 1.0 ELSE 0.0 END) * 100 AS win_rate_pct
@@ -150,6 +199,7 @@ QUERIES = {
     "lane2_delta": """
         MATCH (t:TradeNode {status: 'CLOSED'})
         WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND NOT t.trade_id IN $forensic_ids
         WITH count(t) AS closed_count,
              avg(CASE WHEN t.win_loss = 'Win' THEN 1.0 ELSE 0.0 END) AS l1_rate
         OPTIONAL MATCH (p:PredictionNode)
@@ -170,9 +220,11 @@ QUERIES = {
     "conviction_tiers": """
         MATCH (t:TradeNode)
         WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND NOT t.trade_id IN $forensic_ids
         WITH count(t) AS total
         MATCH (t:TradeNode)
         WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND NOT t.trade_id IN $forensic_ids
         WITH total, t.conviction_tier AS tier, count(t) AS tier_count
         RETURN tier, tier_count, (tier_count * 1.0 / total) * 100 AS tier_pct
     """,
@@ -221,6 +273,7 @@ QUERIES = {
     "returns_matrix_cell": """
         MATCH (t:TradeNode {status: 'CLOSED'})
         WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND NOT t.trade_id IN $forensic_ids
           AND t.asset_class = $asset_class
           AND t.track = $track
         WITH count(t) AS total,
@@ -232,6 +285,7 @@ QUERIES = {
     "returns_matrix_sigma_row": """
         MATCH (t:TradeNode {status: 'CLOSED'})
         WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND NOT t.trade_id IN $forensic_ids
           AND t.track = $track
         WITH count(t) AS total,
              sum(CASE WHEN t.win_loss = 'Win' THEN 1 ELSE 0 END) AS wins,
@@ -242,6 +296,7 @@ QUERIES = {
     "returns_matrix_sigma_col": """
         MATCH (t:TradeNode {status: 'CLOSED'})
         WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND NOT t.trade_id IN $forensic_ids
           AND t.asset_class = $asset_class
         WITH count(t) AS total,
              sum(CASE WHEN t.win_loss = 'Win' THEN 1 ELSE 0 END) AS wins,
@@ -252,6 +307,7 @@ QUERIES = {
     "returns_matrix_sigma_corner": """
         MATCH (t:TradeNode {status: 'CLOSED'})
         WHERE datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND NOT t.trade_id IN $forensic_ids
         WITH count(t) AS total,
              sum(CASE WHEN t.win_loss = 'Win' THEN 1 ELSE 0 END) AS wins,
              collect(t.pnl_percent) AS returns
@@ -458,6 +514,25 @@ CUTOFF_QUERIES = frozenset({
 })
 
 
+# Queries into which main.run_query() auto-injects effective_forensic_ids()
+# as $forensic_ids. Every portal query whose Cypher touches TradeNode for
+# display/analytics. (sharpe_ratio + equity_curve_* read WeeklyContextNode /
+# EquitySnapshotNode aggregates, not TradeNode, so forensic exclusion can't
+# apply at the portal boundary — those would need an engine-side recompute
+# that excludes the forensic trades from the aggregate node writers.)
+FORENSIC_QUERIES = frozenset({
+    "account_bar",
+    "trade_list_recent",
+    "win_rate",
+    "lane2_delta",
+    "conviction_tiers",
+    "returns_matrix_cell",
+    "returns_matrix_sigma_row",
+    "returns_matrix_sigma_col",
+    "returns_matrix_sigma_corner",
+})
+
+
 # Per-query expected parameter keys (for input validation).
 # `cutoff` is NOT listed — it's auto-injected by main.py for CUTOFF_QUERIES.
 REQUIRED_PARAMS = {
@@ -490,6 +565,7 @@ REQUIRED_PARAMS = {
     "engine_heartbeat": [],
     "news_ticker_recent": [],
     "scanner_scores": ["asset_list"],
+    "equity_snapshot_latest": [],
 }
 
 assert set(QUERIES.keys()) == set(REQUIRED_PARAMS.keys()), \

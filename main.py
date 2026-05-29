@@ -49,7 +49,14 @@ from fastapi.responses import JSONResponse
 from neo4j import GraphDatabase, time as neo4j_time
 from pydantic import BaseModel, Field
 
-from queries import CUTOFF_QUERIES, PORTAL_TRADE_CUTOFF_ISO, QUERIES, REQUIRED_PARAMS
+from queries import (
+    CUTOFF_QUERIES,
+    FORENSIC_QUERIES,
+    PORTAL_TRADE_CUTOFF_ISO,
+    QUERIES,
+    REQUIRED_PARAMS,
+    effective_forensic_ids,
+)
 
 load_dotenv()
 
@@ -191,7 +198,7 @@ def root():
         "service": "signaldelta-portal-proxy",
         "version": "0.2.0",
         "queries_whitelisted": sorted(QUERIES.keys()),
-        "endpoints": ["GET /", "GET /health", "POST /query (bearer)", "GET /macro_news (bearer)"],
+        "endpoints": ["GET /", "GET /health", "POST /query (bearer)", "GET /macro_news (bearer)", "GET /market_calendar (bearer)", "GET /broker_account (bearer)"],
         "portal_trade_cutoff_iso": PORTAL_TRADE_CUTOFF_ISO,
     }
 
@@ -221,6 +228,10 @@ def run_query(req: QueryRequest):
     effective_params = dict(req.params)
     if req.name in CUTOFF_QUERIES:
         effective_params.setdefault("cutoff", PORTAL_TRADE_CUTOFF_ISO)
+    # Session 40: auto-inject the forensic exclusion list for any query whose
+    # Cypher references $forensic_ids. Portal never sends it — server-side policy.
+    if req.name in FORENSIC_QUERIES:
+        effective_params.setdefault("forensic_ids", effective_forensic_ids())
 
     required = REQUIRED_PARAMS.get(req.name, [])
     missing = [k for k in required if k not in effective_params]
@@ -482,3 +493,85 @@ def market_calendar():
             "fetched_at_ms": now_ms,
             "fallback": False,
         }
+
+
+# ─── Session 40 portal rebuild (2026-05-29): GET /broker_account ──────────
+# Live Alpaca account + positions for the portal's live-state surfaces
+# (Current Value, Open count, Today P&L numerator, trade-list current price,
+# reconciliation indicator). NO caching — the portal polls every 60s and each
+# poll triggers a fresh broker read, so the displayed equity is the broker's
+# real-time number, not a stale graph-derived value (that was the entire point
+# of the Session 40 sourcing decision).
+#
+# Uses the same APCA-API-KEY-ID / APCA-API-SECRET-KEY headers as
+# /market_calendar against paper-api. On any Alpaca failure: 503 with
+# {error, account:null, positions:[]} so the portal degrades gracefully
+# (Account Bar falls back to dashes, no crash).
+ALPACA_ACCOUNT_URL = "https://paper-api.alpaca.markets/v2/account"
+ALPACA_POSITIONS_URL = "https://paper-api.alpaca.markets/v2/positions"
+
+
+def _alpaca_get(url: str) -> Any:
+    """Blocking authenticated GET against an Alpaca paper REST endpoint."""
+    if not (ALPACA_API_KEY and ALPACA_API_SECRET):
+        raise RuntimeError("Alpaca credentials not configured")
+    req = urllib.request.Request(
+        url,
+        headers={
+            "APCA-API-KEY-ID": ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+            "User-Agent": "signaldelta-portal-proxy/0.3",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+@app.get("/broker_account", dependencies=[Depends(require_bearer)])
+def broker_account():
+    now_ms = int(_time.time() * 1000)
+    try:
+        acct = _alpaca_get(ALPACA_ACCOUNT_URL)
+        raw_positions = _alpaca_get(ALPACA_POSITIONS_URL)
+    except Exception as e:
+        print(f"[proxy] /broker_account fetch error: {e}", file=sys.stderr)
+        return JSONResponse(
+            status_code=503,
+            content={"error": "alpaca_unavailable", "account": None, "positions": []},
+        )
+
+    def _f(d: dict[str, Any], k: str) -> float | None:
+        v = d.get(k)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    account = {
+        "equity": _f(acct, "equity"),
+        "cash": _f(acct, "cash"),
+        "buying_power": _f(acct, "buying_power"),
+        "currency": acct.get("currency", "USD"),
+        "account_number": acct.get("account_number"),
+        "status": acct.get("status"),
+    }
+
+    positions = []
+    if isinstance(raw_positions, list):
+        for p in raw_positions:
+            positions.append({
+                "symbol": p.get("symbol"),
+                "qty": _f(p, "qty"),
+                "side": p.get("side"),
+                "avg_entry_price": _f(p, "avg_entry_price"),
+                "current_price": _f(p, "current_price"),
+                "market_value": _f(p, "market_value"),
+                "unrealized_pl": _f(p, "unrealized_pl"),
+                "unrealized_plpc": _f(p, "unrealized_plpc"),
+            })
+
+    return {
+        "account": account,
+        "positions": positions,
+        "fetched_at_ms": now_ms,
+    }
