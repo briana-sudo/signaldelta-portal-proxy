@@ -37,7 +37,7 @@ PORTAL_TRADE_CUTOFF_ISO = "2026-05-26T13:30:00Z"
 # list as $forensic_ids into any query named in FORENSIC_QUERIES. Stored as
 # a constant here so the list is amendable in one place if more forensic IDs
 # surface later.
-FORENSIC_EXCLUSION_IDS = ["TS-20260526-0003", "TS-20260526-0008"]
+FORENSIC_EXCLUSION_IDS = ["TS-20260526-0003", "TS-20260526-0008", "TS-20260529-0001"]
 
 # T3-GATE (Session 40, undecided): toggle to also exclude V14 gate trades.
 # Default false. The V14 gate-trade identification rule is TBD by the
