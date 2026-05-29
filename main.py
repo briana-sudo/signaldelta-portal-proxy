@@ -549,6 +549,10 @@ def broker_account():
 
     account = {
         "equity": _f(acct, "equity"),
+        # last_equity = broker's prior trading-day close. Session-40 v1.6
+        # Today P&L denominator (fresh, broker-sourced) — replaces the stale
+        # EquitySnapshotNode baseline that produced the −$406 phantom loss.
+        "last_equity": _f(acct, "last_equity"),
         "cash": _f(acct, "cash"),
         "buying_power": _f(acct, "buying_power"),
         "currency": acct.get("currency", "USD"),
