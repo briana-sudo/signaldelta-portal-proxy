@@ -198,7 +198,7 @@ def root():
         "service": "signaldelta-portal-proxy",
         "version": "0.2.0",
         "queries_whitelisted": sorted(QUERIES.keys()),
-        "endpoints": ["GET /", "GET /health", "POST /query (bearer)", "GET /macro_news (bearer)", "GET /market_calendar (bearer)", "GET /broker_account (bearer)"],
+        "endpoints": ["GET /", "GET /health", "POST /query (bearer)", "GET /macro_news (bearer)", "GET /market_calendar (bearer)", "GET /broker_account (bearer)", "GET /price_ticker (bearer)"],
         "portal_trade_cutoff_iso": PORTAL_TRADE_CUTOFF_ISO,
     }
 
@@ -510,6 +510,59 @@ def market_calendar():
 ALPACA_ACCOUNT_URL = "https://paper-api.alpaca.markets/v2/account"
 ALPACA_POSITIONS_URL = "https://paper-api.alpaca.markets/v2/positions"
 
+# ── Partial (b) swap cache (2026-06-01) ───────────────────────────────────
+# 30s TTL on the two residual Alpaca /v2 calls used by /broker_account
+# (account-level numerics now served from AccountStateNode in Neo4j; only
+# last_equity + currency + status + positions list still need Alpaca). The
+# cache absorbs poll bursts so we cannot re-trigger 429 even at high call
+# rates. In-memory, per-process, cleared on restart.
+_ALPACA_BROKER_CACHE_TTL_MS = 30_000
+_alpaca_acct_cache: dict[str, Any] = {"value": None, "ts": 0}
+_alpaca_positions_cache: dict[str, Any] = {"value": None, "ts": 0}
+
+
+def _cached_alpaca_get(cache: dict[str, Any], url: str) -> Any:
+    """30s TTL wrapper for Alpaca /v2 calls used by /broker_account. Stale-
+    by-up-to-30s is acceptable: portal polls every 60s and the operator's
+    Today P&L denominator (last_equity = broker prior-day close) doesn't
+    move within a trading day."""
+    now_ms = int(_time.time() * 1000)
+    if cache["value"] is not None and (now_ms - cache["ts"]) < _ALPACA_BROKER_CACHE_TTL_MS:
+        return cache["value"]
+    value = _alpaca_get(url)
+    cache["value"] = value
+    cache["ts"] = now_ms
+    return value
+
+
+def _load_account_state_for_broker() -> dict[str, Any] | None:
+    """Read singleton AccountStateNode for the /broker_account ACCOUNT block.
+    Returns None when no node exists yet (caller falls back to Alpaca for
+    full backward-compat). Branch-isolated per project convention."""
+    if _driver is None:
+        return None
+    cypher = (
+        "MATCH (a:AccountStateNode) "
+        "WHERE NOT a:KCCNode AND NOT a:KTMNode "
+        "RETURN a.account_id AS account_id, "
+        "       a.portfolio_value AS portfolio_value, "
+        "       a.cash AS cash, "
+        "       a.buying_power AS buying_power, "
+        "       a.non_marginable_buying_power AS non_marginable_buying_power, "
+        "       a.updated_at AS updated_at "
+        "ORDER BY a.account_id ASC LIMIT 1"
+    )
+    try:
+        with _driver.session(database="neo4j", default_access_mode="READ") as session:
+            result = session.run(cypher)
+            row = result.single()
+            if not row:
+                return None
+            return {k: row[k] for k in row.keys()}
+    except Exception as e:
+        print(f"[proxy] /broker_account: AccountStateNode read failed ({e}); falling back to Alpaca", file=sys.stderr)
+        return None
+
 
 def _alpaca_get(url: str) -> Any:
     """Blocking authenticated GET against an Alpaca paper REST endpoint."""
@@ -529,35 +582,102 @@ def _alpaca_get(url: str) -> Any:
 
 @app.get("/broker_account", dependencies=[Depends(require_bearer)])
 def broker_account():
+    """Portal v1.20 partial (b) swap (2026-06-01).
+
+    ACCOUNT-level numeric fields now come from the engine-written
+    AccountStateNode (Neo4j, 25-30s fresh) instead of Alpaca /v2/account
+    on every poll. Removes the per-poll /v2/account hit when the M4
+    writer is up — leaves a single CACHED /v2/account hit (30s TTL) to
+    source `last_equity` (no node source) + `currency`/`status`. The
+    /v2/positions call (per-symbol live current_price for the trade-row
+    Current column + reconciliation pill) stays Alpaca-sourced because
+    AccountStateNode has no positions[] array; that call is also
+    30s-TTL cached. Net Alpaca call rate: ~4/minute regardless of
+    portal poll frequency, vs the prior 2/poll = 2/minute baseline
+    that was burst-prone under multi-client loads.
+
+    Fallback: if AccountStateNode is absent (engine M4 not yet
+    written), the handler falls back fully to Alpaca for backward
+    compatibility — same response shape as the v1.6 implementation."""
     now_ms = int(_time.time() * 1000)
+
+    node = _load_account_state_for_broker()
+
+    alpaca_acct = None
+    raw_positions = None
+    alpaca_acct_err = None
+    alpaca_pos_err = None
     try:
-        acct = _alpaca_get(ALPACA_ACCOUNT_URL)
-        raw_positions = _alpaca_get(ALPACA_POSITIONS_URL)
+        alpaca_acct = _cached_alpaca_get(_alpaca_acct_cache, ALPACA_ACCOUNT_URL)
     except Exception as e:
-        print(f"[proxy] /broker_account fetch error: {e}", file=sys.stderr)
+        alpaca_acct_err = str(e)
+        print(f"[proxy] /broker_account: Alpaca /v2/account fetch failed: {e}", file=sys.stderr)
+    try:
+        raw_positions = _cached_alpaca_get(_alpaca_positions_cache, ALPACA_POSITIONS_URL)
+    except Exception as e:
+        alpaca_pos_err = str(e)
+        print(f"[proxy] /broker_account: Alpaca /v2/positions fetch failed: {e}", file=sys.stderr)
+
+    # If we have NOTHING — no node + no Alpaca at all — keep the old 503
+    # contract so the portal's PROXY ERROR banner still triggers.
+    if node is None and alpaca_acct is None and raw_positions is None:
         return JSONResponse(
             status_code=503,
-            content={"error": "alpaca_unavailable", "account": None, "positions": []},
+            content={
+                "error": "alpaca_unavailable",
+                "account": None,
+                "positions": [],
+                "fetched_at_ms": now_ms,
+            },
         )
 
-    def _f(d: dict[str, Any], k: str) -> float | None:
+    def _f(d: Any, k: str) -> float | None:
+        if not isinstance(d, dict):
+            return None
         v = d.get(k)
         try:
             return float(v) if v is not None else None
         except (TypeError, ValueError):
             return None
 
+    # ── Account block: graph-first; Alpaca fallback if node missing. ──
+    if node is not None:
+        equity      = _f(node, "portfolio_value")
+        cash        = _f(node, "cash")
+        bp          = _f(node, "buying_power")
+        non_marg_bp = _f(node, "non_marginable_buying_power")
+        account_id  = node.get("account_id")
+        source      = "graph"
+    else:
+        equity      = _f(alpaca_acct, "equity")
+        cash        = _f(alpaca_acct, "cash")
+        bp          = _f(alpaca_acct, "buying_power")
+        non_marg_bp = _f(alpaca_acct, "non_marginable_buying_power")
+        account_id  = alpaca_acct.get("account_number") if isinstance(alpaca_acct, dict) else None
+        source      = "alpaca"
+
+    # last_equity, currency, status: Alpaca-only fields. Null when /v2/account
+    # is unreachable; portal Today P&L falls back to EquitySnapshotNode.
+    last_equity = _f(alpaca_acct, "last_equity")
+    currency    = alpaca_acct.get("currency", "USD") if isinstance(alpaca_acct, dict) else "USD"
+    status      = alpaca_acct.get("status") if isinstance(alpaca_acct, dict) else None
+
     account = {
-        "equity": _f(acct, "equity"),
+        "equity": equity,
         # last_equity = broker's prior trading-day close. Session-40 v1.6
-        # Today P&L denominator (fresh, broker-sourced) — replaces the stale
-        # EquitySnapshotNode baseline that produced the −$406 phantom loss.
-        "last_equity": _f(acct, "last_equity"),
-        "cash": _f(acct, "cash"),
-        "buying_power": _f(acct, "buying_power"),
-        "currency": acct.get("currency", "USD"),
-        "account_number": acct.get("account_number"),
-        "status": acct.get("status"),
+        # Today P&L denominator. Stays Alpaca-sourced — no node analog.
+        "last_equity": last_equity,
+        "cash": cash,
+        "buying_power": bp,
+        # New in v1.20: non_marg BP is exposed here too (was only on the M4
+        # health strip). Portal can ignore; harmless additive field.
+        "non_marginable_buying_power": non_marg_bp,
+        "currency": currency,
+        "account_number": account_id,
+        "status": status,
+        # Diagnostic — portal ignores; lets the operator confirm the partial
+        # swap is hitting the graph path under steady state.
+        "source": source,
     }
 
     positions = []
@@ -578,4 +698,148 @@ def broker_account():
         "account": account,
         "positions": positions,
         "fetched_at_ms": now_ms,
+    }
+
+
+# ─── Portal v1.11 (2026-05-29): GET /price_ticker ────────────────────────
+# Live bottom-of-screen price ticker for the desktop portal. Replaces the
+# hardcoded TICKER literal + cosmetic 0.1% wobble in placeholders.js.
+#
+# Symbol source: TradingConfigNode.monitored_assets (32-asset universe) —
+# read via the same Neo4j driver the /query endpoint uses, no hardcoding.
+# Split into stocks vs crypto by the '/' heuristic (BTC/USD is crypto,
+# AAPL is stock) — matches Alpaca's symbol convention exactly.
+#
+# Data: two batched Alpaca snapshot calls per request — one for stocks
+# (feed=sip explicit, account default could regress silently if billing
+# lapses), one for crypto. Reuses the existing _alpaca_get helper. Up to
+# ~50 symbols per batch per Alpaca docs; 32-universe well under. No cache
+# — 60s portal poll already throttles outbound calls; paid SIP plan is
+# 10000 req/min so 2/min is irrelevant.
+#
+# Per symbol normalize: price = latestTrade.p, prev_close = prevDailyBar.c
+# (crypto: prior UTC-day close = standard "24h %" convention), change_pct
+# rounded 2dp, direction 'u'/'d' for green/red, as_of_iso = latestTrade.t.
+# Skip (with log) any symbol Alpaca doesn't snapshot — don't fail the whole
+# call.
+#
+# Graceful degrade: 503 {error, stocks:[], crypto:[]} on Alpaca failure,
+# mirroring /broker_account. Portal renders "PRICE FEED OFFLINE" rather
+# than a frozen stale list.
+
+ALPACA_STOCK_SNAPSHOTS_URL = "https://data.alpaca.markets/v2/stocks/snapshots"
+ALPACA_CRYPTO_SNAPSHOTS_URL = "https://data.alpaca.markets/v1beta3/crypto/us/snapshots"
+
+
+def _load_monitored_assets() -> list[str]:
+    """Read monitored_assets from TradingConfigNode via the singleton driver."""
+    if _driver is None:
+        raise RuntimeError("Neo4j driver not initialized")
+    cypher = QUERIES["monitored_assets"]
+    with _driver.session(database="neo4j", default_access_mode="READ") as session:
+        result = session.run(cypher)
+        row = result.single()
+        if not row:
+            return []
+        raw = row["asset_list"] or []
+        return [str(s) for s in raw if s]
+
+
+def _alpaca_snapshot(url: str, symbols: list[str]) -> dict[str, Any]:
+    """Batched snapshot call. Returns {} on empty symbol list."""
+    if not symbols:
+        return {}
+    qs = urllib.parse.urlencode({"symbols": ",".join(symbols)})
+    if "stocks" in url:
+        qs += "&feed=sip"
+    full = f"{url}?{qs}"
+    return _alpaca_get(full)
+
+
+def _normalize_snapshot(symbol: str, snap: dict[str, Any], with_feed: bool) -> dict[str, Any] | None:
+    """Normalize one Alpaca snapshot entry to the portal contract.
+    Returns None when latestTrade.p or prevDailyBar.c is missing (skip)."""
+    if not isinstance(snap, dict):
+        return None
+    latest = snap.get("latestTrade") or {}
+    prev = snap.get("prevDailyBar") or {}
+    price = latest.get("p")
+    prev_close = prev.get("c")
+    if price is None or prev_close is None or prev_close == 0:
+        return None
+    try:
+        price_f = float(price)
+        prev_f = float(prev_close)
+    except (TypeError, ValueError):
+        return None
+    change_pct = round((price_f - prev_f) / prev_f * 100.0, 2)
+    out = {
+        "symbol": symbol,
+        "price": price_f,
+        "prev_close": prev_f,
+        "change_pct": change_pct,
+        "direction": "u" if change_pct >= 0 else "d",
+        "as_of_iso": latest.get("t"),
+    }
+    if with_feed:
+        out["feed"] = "sip"
+    return out
+
+
+@app.get("/price_ticker", dependencies=[Depends(require_bearer)])
+def price_ticker():
+    now_ms = int(_time.time() * 1000)
+
+    # Symbol universe — straight from the graph, no hardcoding.
+    try:
+        symbols = _load_monitored_assets()
+    except Exception as e:
+        print(f"[proxy] /price_ticker monitored_assets read error: {e}", file=sys.stderr)
+        return JSONResponse(
+            status_code=503,
+            content={"error": "monitored_assets_unavailable", "stocks": [], "crypto": [], "fetched_at_ms": now_ms},
+        )
+
+    # Split by Alpaca symbol convention: '/' → crypto (BASE/USD), else stock.
+    stock_syms = sorted({s for s in symbols if "/" not in s})
+    crypto_syms = sorted({s for s in symbols if "/" in s})
+
+    # Two batched calls (don't loop per symbol).
+    try:
+        stock_raw = _alpaca_snapshot(ALPACA_STOCK_SNAPSHOTS_URL, stock_syms)
+        crypto_raw_full = _alpaca_snapshot(ALPACA_CRYPTO_SNAPSHOTS_URL, crypto_syms)
+    except Exception as e:
+        print(f"[proxy] /price_ticker Alpaca fetch error: {e}", file=sys.stderr)
+        return JSONResponse(
+            status_code=503,
+            content={"error": "alpaca_unavailable", "stocks": [], "crypto": [], "fetched_at_ms": now_ms},
+        )
+
+    # Crypto endpoint nests under {"snapshots": {...}}; stocks returns flat.
+    crypto_raw = crypto_raw_full.get("snapshots", {}) if isinstance(crypto_raw_full, dict) else {}
+
+    stocks_out: list[dict[str, Any]] = []
+    crypto_out: list[dict[str, Any]] = []
+    skipped: list[str] = []
+
+    for sym in stock_syms:
+        row = _normalize_snapshot(sym, stock_raw.get(sym), with_feed=True)
+        if row is None:
+            skipped.append(sym)
+        else:
+            stocks_out.append(row)
+    for sym in crypto_syms:
+        row = _normalize_snapshot(sym, crypto_raw.get(sym), with_feed=False)
+        if row is None:
+            skipped.append(sym)
+        else:
+            crypto_out.append(row)
+
+    if skipped:
+        print(f"[proxy] /price_ticker skipped (no snapshot): {','.join(skipped)}", file=sys.stderr)
+
+    return {
+        "fetched_at_ms": now_ms,
+        "stocks": stocks_out,
+        "crypto": crypto_out,
     }
