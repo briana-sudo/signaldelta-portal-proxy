@@ -153,6 +153,42 @@ QUERIES = {
         ORDER BY t.entry_timestamp DESC
         LIMIT 12
     """,
+    # ── Portal Rev 32 (2026-06-05): windowed trade list for the EXPAND modal.
+    # Mirrors the RUNNING trade_list_recent's isolation + full RETURN column
+    # list (incl. trade_id + EXCLUDED_FROM_CORPUS, which the running clone
+    # carries as an uncommitted Session-42 mutation) so adaptTradeList() maps it
+    # unchanged. Adds a client-driven lower bound $window_start (ISO-8601 UTC);
+    # the modal "all" preset passes 1970-01-01 so the existing $cutoff governs
+    # the floor (modal scope == panel scope). LIMIT 2000 is a safety ceiling.
+    "trade_list_window": """
+        MATCH (t:TradeNode)
+        WHERE NOT t:KCCNode AND NOT t:KTMNode
+          AND datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND datetime(t.entry_timestamp) >= datetime($window_start)
+          AND NOT t.trade_id IN $forensic_ids
+          AND NOT (t)-[:EXCLUDED_FROM_CORPUS]->(:ExclusionNode)
+        RETURN t.trade_id AS trade_id,
+               t.request_id AS request_id,
+               t.asset AS asset,
+               t.track AS track,
+               t.conviction_tier AS conviction,
+               t.entry_price AS entry_price,
+               t.exit_price AS exit_price,
+               t.stop_loss_price AS stop_price,
+               t.target_price AS target_price,
+               t.direction AS direction,
+               t.entry_timestamp AS entry_timestamp,
+               t.exit_timestamp AS exit_timestamp,
+               t.status AS status,
+               t.pnl_dollar AS pnl_dollar,
+               t.pnl_percent AS pnl_percent,
+               t.realized_pnl AS realized_pnl,
+               t.win_loss AS win_loss,
+               t.hold_duration_min AS hold_duration_min,
+               t.exit_reason AS exit_reason
+        ORDER BY t.entry_timestamp DESC
+        LIMIT 2000
+    """,
 
     # Portal v1.1 dispatch 2026-05-26 (status-strip 5-event cycle): dropped
     # the 30-min lookback so the strip always shows the 5 most recent events
@@ -501,6 +537,7 @@ CUTOFF_QUERIES = frozenset({
     "account_bar",
     "open_positions",
     "trade_list_recent",
+    "trade_list_window",
     "win_rate",
     "lane2_delta",
     "conviction_tiers",
@@ -523,6 +560,7 @@ CUTOFF_QUERIES = frozenset({
 FORENSIC_QUERIES = frozenset({
     "account_bar",
     "trade_list_recent",
+    "trade_list_window",
     "win_rate",
     "lane2_delta",
     "conviction_tiers",
@@ -540,6 +578,7 @@ REQUIRED_PARAMS = {
     "weekly_waterfall": [],
     "open_positions": [],
     "trade_list_recent": [],
+    "trade_list_window": ["window_start"],
     "recent_events": [],
     "win_rate": [],
     "sharpe_ratio": [],
