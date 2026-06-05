@@ -189,6 +189,42 @@ QUERIES = {
         ORDER BY t.entry_timestamp DESC
         LIMIT 2000
     """,
+    # ── Portal Rev 42 (2026-06-04): single-ET-day CLOSED feed for the DAY W/L
+    # (ET) banner stat + the ALL TRADES modal day buckets. Mirrors
+    # trade_list_window's isolation + FULL RETURN columns (so adaptTradeList maps
+    # it unchanged) but filters CLOSED trades by EXIT timestamp within the
+    # client-supplied [day_start, day_end) ET-calendar-day instants. $cutoff +
+    # $forensic_ids auto-inject (same scope as the panel). LIMIT 2000 ceiling.
+    "trades_closed_day": """
+        MATCH (t:TradeNode {status: 'CLOSED'})
+        WHERE NOT t:KCCNode AND NOT t:KTMNode
+          AND datetime(t.entry_timestamp) >= datetime($cutoff)
+          AND datetime(t.exit_timestamp) >= datetime($day_start)
+          AND datetime(t.exit_timestamp) <  datetime($day_end)
+          AND NOT t.trade_id IN $forensic_ids
+          AND NOT (t)-[:EXCLUDED_FROM_CORPUS]->(:ExclusionNode)
+        RETURN t.trade_id AS trade_id,
+               t.request_id AS request_id,
+               t.asset AS asset,
+               t.track AS track,
+               t.conviction_tier AS conviction,
+               t.entry_price AS entry_price,
+               t.exit_price AS exit_price,
+               t.stop_loss_price AS stop_price,
+               t.target_price AS target_price,
+               t.direction AS direction,
+               t.entry_timestamp AS entry_timestamp,
+               t.exit_timestamp AS exit_timestamp,
+               t.status AS status,
+               t.pnl_dollar AS pnl_dollar,
+               t.pnl_percent AS pnl_percent,
+               t.realized_pnl AS realized_pnl,
+               t.win_loss AS win_loss,
+               t.hold_duration_min AS hold_duration_min,
+               t.exit_reason AS exit_reason
+        ORDER BY t.exit_timestamp DESC
+        LIMIT 2000
+    """,
 
     # Portal v1.1 dispatch 2026-05-26 (status-strip 5-event cycle): dropped
     # the 30-min lookback so the strip always shows the 5 most recent events
@@ -538,6 +574,7 @@ CUTOFF_QUERIES = frozenset({
     "open_positions",
     "trade_list_recent",
     "trade_list_window",
+    "trades_closed_day",
     "win_rate",
     "lane2_delta",
     "conviction_tiers",
@@ -561,6 +598,7 @@ FORENSIC_QUERIES = frozenset({
     "account_bar",
     "trade_list_recent",
     "trade_list_window",
+    "trades_closed_day",
     "win_rate",
     "lane2_delta",
     "conviction_tiers",
@@ -579,6 +617,7 @@ REQUIRED_PARAMS = {
     "open_positions": [],
     "trade_list_recent": [],
     "trade_list_window": ["window_start"],
+    "trades_closed_day": ["day_start", "day_end"],
     "recent_events": [],
     "win_rate": [],
     "sharpe_ratio": [],
