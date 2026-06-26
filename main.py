@@ -38,8 +38,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
-from datetime import datetime, date, time
-from threading import Lock
+from datetime import datetime, date, time, timezone
+import hashlib
+from threading import Lock, Thread
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from dotenv import load_dotenv
@@ -50,11 +52,13 @@ from neo4j import GraphDatabase, time as neo4j_time
 from pydantic import BaseModel, Field
 
 from queries import (
+    CORRUPT_EXCLUDE_QUERIES,
     CUTOFF_QUERIES,
     FORENSIC_QUERIES,
     PORTAL_TRADE_CUTOFF_ISO,
     QUERIES,
     REQUIRED_PARAMS,
+    effective_corrupt_exclude_ids,
     effective_forensic_ids,
 )
 
@@ -88,6 +92,15 @@ ALPACA_API_SECRET = (
 # Calendar endpoint is the SAME on paper + live (calendar data is universal).
 # Use paper-api to keep parity with the engine's Phase 1 paper account.
 ALPACA_CALENDAR_BASE = "https://paper-api.alpaca.markets/v2/calendar"
+
+# ── Item 10 PULL: secured WRITE path. A SEPARATE write token (not the read
+# PROXY_API_TOKEN) so a read-token leak can never trigger a compute+write. The
+# engine runs in its OWN venv via subprocess — the proxy stays a thin auth gate. ──
+import subprocess
+STORM_WRITE_TOKEN = os.environ.get("STORM_WRITE_TOKEN")
+STORM_ENGINE_ROOT = os.environ.get("STORM_ENGINE_ROOT", r"C:\KCC_Local\storm-engine")
+STORM_ENGINE_PY = os.path.join(STORM_ENGINE_ROOT, ".venv", "Scripts", "python.exe")
+PULL_RADIUS_CAP_MI = 150.0       # HARD server-side cap (area ceiling: pi*150^2 ~ 70,686 mi^2)
 
 if not PROXY_API_TOKEN:
     raise RuntimeError(
@@ -162,6 +175,17 @@ def require_bearer(authorization: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=403, detail="Invalid bearer token")
 
 
+def require_write_bearer(authorization: str | None = Header(default=None)) -> None:
+    """Separate, stronger gate for the WRITE endpoint (Item 10 PULL). Unauthenticated
+    requests are rejected. Distinct from the read token so a read-token leak cannot write."""
+    if not STORM_WRITE_TOKEN:
+        raise HTTPException(status_code=503, detail="Write endpoint not configured (STORM_WRITE_TOKEN unset)")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    if authorization[len("Bearer "):].strip() != STORM_WRITE_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid bearer token")
+
+
 # ─── Request / response models ────────────────────────────────────────────
 class QueryRequest(BaseModel):
     name: str = Field(..., description="Whitelisted query name from queries.QUERIES")
@@ -214,6 +238,205 @@ def health():
         raise HTTPException(status_code=503, detail=f"Neo4j unreachable: {e}")
 
 
+# ─── Scanner Tier 2 (2026-06-09): server-side GO enrichment ───────────────────
+# The scanner_live_state query returns the engine's raw live gate inputs; the
+# GO decision needs the ET clock + thresholds the engine doesn't expose, so it's
+# computed here per poll. GO = G1 ∧ G2 ∧ G3 ∧ tradable-now ∧ fresh. Cash is
+# deliberately NOT part of GO — stocks don't light when the equity market is
+# closed (that's `tradable`).
+_ET_TZ = ZoneInfo("America/New_York")
+_AGGRESSIVE_BASE_THRESHOLD = 58    # §5 lowest track bar (clears ≥1 track). Canonical.
+_SCANNER_FRESH_SECONDS = 12 * 60   # ≈2 bars; a stale row never GOes.
+
+
+def _bucket_modifier_et(et_minutes: int) -> int:
+    """§4.2 time-bucket modifier from ET minutes-since-midnight (covers 24h):
+    High(+0) 9:30-11:30 & 14:00-16:00; Medium(+5) 7:00-9:30, 11:30-14:00,
+    16:00-18:00, 20:00-22:00; Low(+10) 6:00-7:00, 18:00-20:00, 22:00-24:00;
+    Dead(+15) 0:00-6:00."""
+    m = et_minutes
+    if (570 <= m < 690) or (840 <= m < 960):
+        return 0   # High
+    if (420 <= m < 570) or (690 <= m < 840) or (960 <= m < 1080) or (1200 <= m < 1320):
+        return 5   # Medium
+    if (360 <= m < 420) or (1080 <= m < 1200) or (1320 <= m < 1440):
+        return 10  # Low
+    return 15      # Dead 0:00-6:00
+
+
+def _equity_market_open(now_et: datetime) -> bool:
+    """Mon-Fri 9:30-16:00 ET (holidays not modeled, per dispatch spec)."""
+    if now_et.weekday() >= 5:
+        return False
+    m = now_et.hour * 60 + now_et.minute
+    return 570 <= m < 960
+
+
+def _enrich_scanner_live_state(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Augment each ScannerLiveStateNode row with the GO decision + the five
+    gate booleans, against the live ET clock. Read-only / pure. GO lights only
+    when an asset is fireable RIGHT NOW: G1∧G2∧G3∧tradable∧fresh."""
+    now_et = datetime.now(_ET_TZ)
+    now_utc = datetime.now(timezone.utc)
+    modifier = _bucket_modifier_et(now_et.hour * 60 + now_et.minute)
+    market_open = _equity_market_open(now_et)
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        asset = r.get("asset")
+        is_crypto = isinstance(asset, str) and "/" in asset
+        comp = r.get("composite")
+        composite = float(comp) if comp is not None else 0.0
+        contributors = int(r.get("contributors") or 0)
+        g1 = contributors >= 3
+        g2 = bool(r.get("g2_agreed"))
+        g3 = composite >= (_AGGRESSIVE_BASE_THRESHOLD + modifier)
+        tradable = True if is_crypto else market_open
+        fresh = False
+        eval_ts = r.get("eval_ts")
+        if eval_ts:
+            try:
+                dt = datetime.fromisoformat(str(eval_ts).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                fresh = (now_utc - dt).total_seconds() <= _SCANNER_FRESH_SECONDS
+            except Exception:
+                fresh = False
+        out.append({
+            **r,
+            "composite": composite,
+            "g1": g1, "g2": g2, "g3": g3,
+            "tradable": tradable, "fresh": fresh,
+            "go": g1 and g2 and g3 and tradable and fresh,
+            "asset_class": "CRY" if is_crypto else "STK",
+            "bucket_modifier": modifier,
+        })
+    return out
+
+
+# ─── §6.6 annualization post-processors (2026-06-10) ─────────────────────────
+# Operator-decided basis (do not re-derive): annualized = (1 + cum)^(252 /
+# equity_days) − 1, where cum is the cohort's WINDOW cumulative return and
+# equity_days = distinct EquitySnapshotNode days. insufficient_history =
+# equity_days < 30, served ALONGSIDE the value (never suppressed). The
+# annualization is computed HERE (proxy), never in the frontend.
+def _compound_return(returns: list) -> float:
+    """Cumulative return (fraction) of a cohort = ∏(1 + r/100) − 1 over the
+    cohort's per-trade pnl_percent values."""
+    acc = 1.0
+    for r in returns or []:
+        if r is None:
+            continue
+        try:
+            acc *= 1.0 + float(r) / 100.0
+        except (TypeError, ValueError):
+            continue
+    return acc - 1.0
+
+
+def _annualize_pct(cum_fraction: float, equity_days: int) -> float | None:
+    """(1 + cum)^(252 / equity_days) − 1, returned as a PERCENT. None when
+    equity_days <= 0 or the cohort is ≤ −100% (annualized return undefined)."""
+    if not equity_days or equity_days <= 0:
+        return None
+    base = 1.0 + cum_fraction
+    if base <= 0.0:
+        return None
+    return (base ** (252.0 / equity_days) - 1.0) * 100.0
+
+
+def _enrich_returns_by_domain_pct(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build the annualized grid (cells + Total rim + Total corner) from the raw
+    per-cell rows the Cypher returns. Each group is compounded over ITS trades
+    then annualized — rims/corner are NOT sums of cell %s (annualized % is not
+    additive), they recompound over the concatenated cohort, so the served
+    population is identical to the $ view by construction."""
+    if not rows:
+        return []
+    equity_days = int(rows[0].get("equity_days") or 0)
+    insufficient = equity_days < 30
+    groups: dict[str, dict[str, Any]] = {}
+
+    def add(key, scope_type, track, ac, rets, pnl, n):
+        g = groups.setdefault(key, {"scope_type": scope_type, "track": track,
+                                    "asset_class": ac, "returns": [],
+                                    "pnl_dollar": 0.0, "n": 0})
+        g["returns"].extend(rets or [])
+        g["pnl_dollar"] += float(pnl or 0.0)
+        g["n"] += int(n or 0)
+
+    for r in rows:
+        tr = r.get("track")
+        ac = r.get("asset_class")
+        rets = r.get("returns") or []
+        pnl = r.get("pnl_dollar") or 0.0
+        n = r.get("n") or 0
+        add(f"cell:{tr}:{ac}", "cell", tr, ac, rets, pnl, n)
+        add(f"row:{tr}", "row_total", tr, None, rets, pnl, n)   # per track, all asset classes
+        add(f"col:{ac}", "col_total", None, ac, rets, pnl, n)   # per asset class, all tracks
+        add("corner", "corner", None, None, rets, pnl, n)
+
+    out = []
+    for g in groups.values():
+        cum = _compound_return(g["returns"])
+        ann = _annualize_pct(cum, equity_days)
+        out.append({
+            "scope_type": g["scope_type"],
+            "track": g["track"],
+            "asset_class": g["asset_class"],
+            "n": g["n"],
+            "pnl_dollar": round(g["pnl_dollar"], 2),
+            "cum_return_pct": round(cum * 100.0, 4),
+            "annualized_pct": (round(ann, 4) if ann is not None else None),
+            "equity_days": equity_days,
+            "insufficient_history": insufficient,
+        })
+    return out
+
+
+def _enrich_pf_expectancy_series(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Cumulative-to-date profit_factor + expectancy per exit-day for the KPI-tile
+    sparklines. Cypher returns per-day gross_profit/gross_loss/sum_pnl/n (ordered);
+    we accumulate so each point is PF/expectancy over all closes through that day."""
+    if not rows:
+        return []
+    cum_gp = cum_gl = cum_pnl = 0.0
+    cum_n = 0
+    out = []
+    for r in rows:
+        cum_gp += float(r.get("gross_profit") or 0.0)
+        cum_gl += float(r.get("gross_loss") or 0.0)
+        cum_pnl += float(r.get("sum_pnl") or 0.0)
+        cum_n += int(r.get("n") or 0)
+        pf = (cum_gp / cum_gl) if cum_gl > 0 else None
+        exp = (cum_pnl / cum_n) if cum_n > 0 else None
+        out.append({
+            "day": r.get("day"),
+            "n": cum_n,
+            "profit_factor": (round(pf, 4) if pf is not None else None),
+            "expectancy_dollar": (round(exp, 4) if exp is not None else None),
+        })
+    return out
+
+
+def _enrich_annualized_return(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Account-level annualized return for the header Ann field — same formula +
+    flag. Cypher gives cum_return + equity_days; we annualize here."""
+    if not rows:
+        return []
+    r = rows[0]
+    equity_days = int(r.get("equity_days") or 0)
+    cum = float(r.get("cum_return") or 0.0)
+    ann = _annualize_pct(cum, equity_days)
+    return [{
+        "equity_days": equity_days,
+        "latest_equity": r.get("latest_equity"),
+        "capital_base": r.get("capital_base"),
+        "cum_return_pct": round(cum * 100.0, 4),
+        "annualized_pct": (round(ann, 4) if ann is not None else None),
+        "insufficient_history": equity_days < 30,
+    }]
+
+
 @app.post("/query", response_model=QueryResponse, dependencies=[Depends(require_bearer)])
 def run_query(req: QueryRequest):
     if req.name not in QUERIES:
@@ -232,6 +455,10 @@ def run_query(req: QueryRequest):
     # Cypher references $forensic_ids. Portal never sends it — server-side policy.
     if req.name in FORENSIC_QUERIES:
         effective_params.setdefault("forensic_ids", effective_forensic_ids())
+    # §6.6 (2026-06-10): auto-inject the frozen 36-id corrupt-close exclude list
+    # for the all-time $-panels. Server-side policy; portal never sends it.
+    if req.name in CORRUPT_EXCLUDE_QUERIES:
+        effective_params.setdefault("corrupt_ids", effective_corrupt_exclude_ids())
 
     required = REQUIRED_PARAMS.get(req.name, [])
     missing = [k for k in required if k not in effective_params]
@@ -251,7 +478,86 @@ def run_query(req: QueryRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Neo4j query failed: {e}")
 
+    # Scanner Tier 2: compute the GO decision per asset server-side (ET clock +
+    # thresholds the engine doesn't expose). Pure post-processing of the rows.
+    if req.name == "scanner_live_state":
+        rows = _enrich_scanner_live_state(rows)
+    # §6.6 annualized post-processing (2026-06-10): the proxy computes the
+    # annualization (operator formula) server-side — NEVER the frontend. The
+    # Cypher returns raw inputs; these build the served annualized numbers.
+    elif req.name == "panel_returns_by_domain_pct":
+        rows = _enrich_returns_by_domain_pct(rows)
+    elif req.name == "panel_annualized_return":
+        rows = _enrich_annualized_return(rows)
+    elif req.name == "panel_pf_expectancy_series":
+        rows = _enrich_pf_expectancy_series(rows)
+
     return QueryResponse(name=req.name, rows=rows, row_count=len(rows))
+
+
+# ─── Item 10: secured WRITE endpoint — on-demand PULL (compute + store) ──────
+# NOT in the read-only /query whitelist. Token-gated (require_write_bearer, a
+# SEPARATE write token). Validates auth + radius cap + CONUS + archive date, then
+# shells out to the storm engine's OWN venv to run the canonical pipeline over the
+# 150mi circle and persist chase data (in_geofence=False / 'chase', pull-namespaced).
+class PullRequest(BaseModel):
+    lat: float
+    lon: float
+    date: str
+    radius_mi: float = Field(default=150.0)
+
+
+PULL_SUBPROC_TIMEOUT = 600   # generous; compute is detached from the HTTP request
+
+
+def _pull_center_hash(lat: float, lon: float) -> str:
+    """Mirror storm.service.pull._center_hash EXACTLY so the job_id the proxy
+    returns equals the one the engine writes on its PullJob marker."""
+    return hashlib.md5(f"{float(lat):.3f},{float(lon):.3f}".encode()).hexdigest()[:8]
+
+
+def _run_pull_detached(lat: float, lon: float, date: str, radius: float) -> None:
+    """Run the engine pull subprocess to completion in a background thread. Its
+    result is the PullJob marker it writes (run_pull) — the poll reads THAT, so we
+    don't parse stdout here. Any failure is captured in the marker's 'error' state."""
+    try:
+        subprocess.run(
+            [STORM_ENGINE_PY, "-m", "storm.service.pull",
+             "--lat", str(lat), "--lon", str(lon),
+             "--date", str(date), "--radius", str(radius)],
+            cwd=STORM_ENGINE_ROOT, env={**os.environ, "PYTHONPATH": STORM_ENGINE_ROOT},
+            capture_output=True, text=True, timeout=PULL_SUBPROC_TIMEOUT)
+    except Exception:
+        pass   # marker is source of truth; a hard crash leaves state='running' -> portal times out
+
+
+@app.post("/storm_pull", dependencies=[Depends(require_write_bearer)])
+def storm_pull(req: PullRequest):
+    # HARD server-side guardrails (defense in depth; run_pull re-validates too).
+    if req.radius_mi > PULL_RADIUS_CAP_MI + 1e-6:
+        raise HTTPException(status_code=400,
+                            detail=f"radius {req.radius_mi}mi exceeds the {PULL_RADIUS_CAP_MI}mi cap")
+    if req.radius_mi <= 0:
+        raise HTTPException(status_code=400, detail="radius must be positive")
+    if not (20.0 <= req.lat <= 55.0 and -130.0 <= req.lon <= -60.0):
+        raise HTTPException(status_code=400, detail="center is outside CONUS bounds")
+    if str(req.date) < "2020-10-14":
+        raise HTTPException(status_code=400, detail="date before operational archive start 2020-10-14")
+    radius = min(req.radius_mi, PULL_RADIUS_CAP_MI)
+    if not os.path.exists(STORM_ENGINE_PY):
+        raise HTTPException(status_code=503, detail="storm engine venv not found on host")
+    # The grib decode can run ~30s on this host (background-service CPU throttle) and
+    # the first decode of a new date longer — well past the Netlify (10-26s) and tunnel
+    # (~30s) ceilings. So this is FIRE-AND-FORGET: spawn the compute detached and return
+    # a job_id immediately. The engine writes a PullJob lifecycle marker; the portal
+    # polls the READ-ONLY storm_pull_status whitelist on that id. This handler is the
+    # ONLY write trigger (write-bearer gated); the poll can never start a compute.
+    job_id = f"pull-{req.date}-{_pull_center_hash(req.lat, req.lon)}"
+    Thread(target=_run_pull_detached, args=(req.lat, req.lon, req.date, radius),
+           daemon=True).start()
+    return JSONResponse(status_code=202, content={
+        "status": "accepted", "job_id": job_id, "date": req.date,
+        "center": [req.lat, req.lon], "radius_mi": radius})
 
 
 # ─── Portal v1.1 Change 4: GET /macro_news ────────────────────────────────
@@ -535,6 +841,34 @@ def _cached_alpaca_get(cache: dict[str, Any], url: str) -> Any:
     return value
 
 
+# Today P&L stale-basis guard (2026-06-06). AccountStateNode.portfolio_value
+# (= equity + unrealized) is the basis the portal's Today P&L is measured against
+# (equity − last_equity). If the M4 writer hasn't refreshed the node, that value
+# can be stale-HIGH after an unrealized crypto spike reverts, inflating today-$
+# (observed +$543.73). When the node is older than this many seconds, the handler
+# falls back to LIVE Alpaca equity for the equity basis. Fresh nodes keep the
+# graph value (preserving the partial-(b) 429 mitigation).
+ACCOUNT_STATE_FRESH_S = 90
+
+
+def _account_state_age_seconds(updated_at: Any) -> float | None:
+    """Age in seconds of an AccountStateNode.updated_at value (ISO-8601 string or
+    neo4j DateTime). Returns None when absent/unparseable — the caller treats
+    that as STALE (can't confirm freshness → don't trust the graph basis)."""
+    if not updated_at:
+        return None
+    try:
+        if hasattr(updated_at, "to_native"):       # neo4j DateTime
+            dt = updated_at.to_native()
+        else:
+            dt = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds()
+    except Exception:
+        return None
+
+
 def _load_account_state_for_broker() -> dict[str, Any] | None:
     """Read singleton AccountStateNode for the /broker_account ACCOUNT block.
     Returns None when no node exists yet (caller falls back to Alpaca for
@@ -642,12 +976,23 @@ def broker_account():
 
     # ── Account block: graph-first; Alpaca fallback if node missing. ──
     if node is not None:
-        equity      = _f(node, "portfolio_value")
         cash        = _f(node, "cash")
         bp          = _f(node, "buying_power")
         non_marg_bp = _f(node, "non_marginable_buying_power")
         account_id  = node.get("account_id")
-        source      = "graph"
+        # Today P&L stale-basis guard (2026-06-06): the equity basis is graph
+        # when the node is fresh, else LIVE Alpaca equity. cash/bp are not the
+        # today-P&L basis and stay graph-sourced (kept the 429 mitigation).
+        graph_equity  = _f(node, "portfolio_value")
+        alpaca_equity = _f(alpaca_acct, "equity")
+        age_s = _account_state_age_seconds(node.get("updated_at"))
+        stale = (age_s is None) or (age_s > ACCOUNT_STATE_FRESH_S)
+        if stale and alpaca_equity is not None:
+            equity = alpaca_equity
+            source = "graph_stale_equity_alpaca"   # node too old → live equity basis
+        else:
+            equity = graph_equity
+            source = "graph" if not stale else "graph_stale_no_alpaca"  # stale but Alpaca down → best-effort graph
     else:
         equity      = _f(alpaca_acct, "equity")
         cash        = _f(alpaca_acct, "cash")
