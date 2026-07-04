@@ -137,6 +137,21 @@ class SMResearchRequest(BaseModel):
     kind: str = "price-research"
 
 
+class SMAnalystRequest(BaseModel):
+    ask: str
+    history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SMLessonProposeRequest(BaseModel):
+    text: str
+    source: str = ""
+    lesson_id: str | None = None
+
+
+class SMLessonActionRequest(BaseModel):
+    lesson_id: str
+
+
 # --- the router --------------------------------------------------------------
 sm_router = APIRouter(prefix="/sm", tags=["search-master"])
 
@@ -295,6 +310,70 @@ def sm_research(req: SMResearchRequest):
     Approve stays the operator's. (No onboard/resolve/secrets call in this path.)"""
     import sm_costing
     return sm_costing.research(req.surface_id, req.surface)
+
+
+# --- ANALYST (real LLM, grounded) + GATED LEARNING (SMLesson) -----------------
+def _analyst_state() -> dict[str, Any]:
+    """Assemble the read-only grounding state: live board/watches/scans (7688) +
+    recent run results (with date-range/universe) + banked lessons. Reads only."""
+    state: dict[str, Any] = {}
+    try:
+        rm = sm_readmodel()
+        state.update({"board": rm.get("board"), "watches": rm.get("watches"),
+                      "scan_history": rm.get("scan_history")})
+    except Exception:
+        pass
+    try:
+        run_queue, _ = _sm_engine()
+        pst = run_queue.status()
+        state["queue"] = pst.get("queue")
+        state["runs"] = [(d.get("result") or {}) for d in (pst.get("done") or [])]
+    except Exception:
+        pass
+    try:
+        import sm_lessons
+        state["lessons"] = sm_lessons.lessons()
+    except Exception:
+        state["lessons"] = []
+    return state
+
+
+@sm_router.post("/analyst/ask", dependencies=[Depends(require_operator_identity)])
+def sm_analyst_ask(req: SMAnalystRequest):
+    """Grounded LLM answer (read-only): assembles the state+corpus+lessons pack
+    server-side and calls the Anthropic API. Honest fallback (never empty) on missing
+    key/API error. FIREWALL: the analyst path holds NO write capability — it reads
+    state and calls the LLM; it never resolves, onboards, banks, or touches 7687."""
+    import sm_analyst
+    return sm_analyst.answer(req.ask, req.history or [], _analyst_state())
+
+
+@sm_router.get("/lessons", dependencies=[Depends(require_operator_identity)])
+def sm_lessons_list():
+    import sm_lessons
+    return {"lessons": sm_lessons.lessons()}
+
+
+@sm_router.post("/lesson/propose", dependencies=[Depends(require_operator_identity)])
+def sm_lesson_propose(req: SMLessonProposeRequest):
+    """Draft a lesson as PROPOSED (gated). This can NEVER set BANKED — banking is the
+    operator's separate endpoint below."""
+    import sm_lessons
+    return sm_lessons.propose(req.text, source=req.source, proposed_by="operator-request",
+                              lesson_id=req.lesson_id)
+
+
+@sm_router.post("/lesson/bank", dependencies=[Depends(require_operator_identity)])
+def sm_lesson_bank(req: SMLessonActionRequest):
+    """OPERATOR-ONLY promotion to BANKED (loads into every future grounding pack)."""
+    import sm_lessons
+    return sm_lessons.bank(req.lesson_id)
+
+
+@sm_router.post("/lesson/reject", dependencies=[Depends(require_operator_identity)])
+def sm_lesson_reject(req: SMLessonActionRequest):
+    import sm_lessons
+    return sm_lessons.reject(req.lesson_id)
 
 
 # --- DISCOVERY-ENGINE POWER SWITCH (start/stop/status of the discovery service) ---
