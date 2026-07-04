@@ -198,6 +198,44 @@ def sm_export(req: SMQueryRequest):
     return {"rows": rows, "row_count": len(rows)}
 
 
+def _surface_of(parent_or_id: str) -> str:
+    """Coverage surface for a run/board id: 'new-search-surface:V-015#V-015-TDF' -> 'V-015'."""
+    p = str(parent_or_id or "").split("#")[0]
+    return p.split(":")[-1] if ":" in p else p
+
+
+def _derive_cell_status(grid: list[dict[str, Any]], runs: list[dict[str, Any]]) -> None:
+    """MAP LIVENESS — cell status is DERIVED from the component RUN RESULTS via the
+    fixed taxonomy AT READ TIME, not read from a stored (mutable, go-stale) cell.
+    A surface reads its true state on cold load, before any Re-evaluate: V-015's
+    components already carry results in 7688, so re-deriving t/n through the current
+    taxonomy paints TESTED-INCONCLUSIVE even if the stored cell says 'whitespace'.
+    The generator's intrinsic status (whitespace/gated/occupied) stands for untested
+    surfaces. Best-effort: any hiccup leaves the stored status untouched."""
+    try:
+        if r"C:\SignalDelta_Local" not in _sys.path:
+            _sys.path.insert(0, r"C:\SignalDelta_Local")
+        from searchmaster.engine import taxonomy
+    except Exception:
+        return
+    by_surface: dict[str, list[str]] = {}
+    for r in runs or []:
+        if r.get("kind") == "reterminus":
+            continue
+        res = r.get("result")
+        if not isinstance(res, dict) or res.get("t") is None:
+            continue
+        disp = taxonomy.disposition_for(
+            gate_pass=res.get("gate_pass"), t=res.get("t"), n=res.get("n"),
+            edge=res.get("edge_pct_per_day"), gate=res.get("gate") or {})
+        by_surface.setdefault(_surface_of(r.get("parent") or r.get("item_id")), []).append(disp)
+    for cell in grid or []:
+        disps = by_surface.get(cell.get("surface"))
+        if disps:
+            _, status = taxonomy.aggregate_parent(disps)
+            cell["status"] = taxonomy.cell_status_for_parent(status)   # DERIVED override
+
+
 @sm_router.get("/readmodel", dependencies=[Depends(require_operator_identity)])
 def sm_readmodel():
     """Reconstruct the operator-surface read model (the 7 slices) from the LIVE 7688
@@ -223,10 +261,13 @@ def sm_readmodel():
             cy = f"MATCH (n:{label}) WHERE {_BRANCH_ISOLATION} RETURN n{order}"
             return [unflat(r["n"]) for r in session.run(cy)]
         state = rows("SMState")
+        grid = rows("SMGridCell")
+        runs = rows("SMRunRequest")
+        _derive_cell_status(grid, runs)               # MAP LIVENESS: derived, not stored
         return {
             "board": rows("SMBoardItem"),
             "state": state[0] if state else {},
-            "grid": rows("SMGridCell"),
+            "grid": grid,
             "ledger": rows("SMComponent"),
             "kills": rows("SMKill"),
             "gated": rows("SMGatedSurface"),
@@ -236,7 +277,7 @@ def sm_readmodel():
             "scan_history": rows("SMScan", order=" ORDER BY n.at DESC"),
             # every run (probe / component / re-terminus) with its stage progress,
             # result, disposition record + report version history — the Run Room source
-            "runs": rows("SMRunRequest"),
+            "runs": runs,
             # TERMINUS combiner outputs: per-run return streams + pairwise rho graph
             "streams": rows("SMReturnStream"),
             "correlations": [

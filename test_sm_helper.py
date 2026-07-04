@@ -57,7 +57,10 @@ class HelperTest(unittest.TestCase):
         code, body = _call("/helper/restart", "POST", tok="unittok")
         self.assertEqual(code, 202)
         self.assertEqual(body["status"], "restarting")
-        time.sleep(0.1)
+        for _ in range(100):                                                 # poll, don't race a fixed sleep
+            if len(self.restarts) >= 1:
+                break
+            time.sleep(0.02)
         self.assertGreaterEqual(len(self.restarts), 1)                       # restart worker invoked
 
     def test_no_trade_or_graph_surface(self):
