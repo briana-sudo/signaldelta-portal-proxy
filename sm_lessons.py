@@ -78,6 +78,17 @@ def bank(lesson_id: str) -> dict[str, Any]:
     return {"id": lesson_id, "status": rec["st"] if rec else "not-found"}
 
 
+def unbank(lesson_id: str) -> dict[str, Any]:
+    """OPERATOR retracts a banked lesson → RETRACTED: removed from the grounding pack
+    (assemble_pack loads only BANKED), history kept. Only a BANKED lesson can unbank."""
+    d = _driver()
+    with d.session(database=_DB) as s:
+        rec = s.run(f"MATCH (n:SMLesson {{id:$i}}) WHERE {_ISO} AND n.status='BANKED' "
+                    "SET n.status='RETRACTED', n.retracted_at=$now RETURN n.status AS st",
+                    i=lesson_id, now=_now()).single()
+    return {"id": lesson_id, "status": rec["st"] if rec else "not-banked"}
+
+
 def reject(lesson_id: str) -> dict[str, Any]:
     d = _driver()
     with d.session(database=_DB) as s:

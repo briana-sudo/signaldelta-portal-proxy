@@ -464,6 +464,14 @@ def sm_lesson_reject(req: SMLessonActionRequest):
     return sm_lessons.reject(req.lesson_id)
 
 
+@sm_router.post("/lesson/unbank", dependencies=[Depends(require_operator_identity)])
+def sm_lesson_unbank(req: SMLessonActionRequest):
+    """OPERATOR-ONLY: retract a banked lesson (→ RETRACTED, out of the grounding pack;
+    history kept). The inverse of Bank."""
+    import sm_lessons
+    return sm_lessons.unbank(req.lesson_id)
+
+
 # --- DISCOVERY-ENGINE POWER SWITCH (start/stop/status of the discovery service) ---
 # Controls the search-master discovery service ONLY (hardcoded in sm_engine as
 # SignalDeltaDiscovery — no service-name parameter exists anywhere in this path, so
