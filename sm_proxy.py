@@ -152,6 +152,16 @@ class SMLessonActionRequest(BaseModel):
     lesson_id: str
 
 
+class SMTerminusLLMRequest(BaseModel):
+    system: str
+    user: str
+    max_tokens: int = 1024
+
+
+class SMReevaluateRequest(BaseModel):
+    item_id: str
+
+
 # --- the router --------------------------------------------------------------
 sm_router = APIRouter(prefix="/sm", tags=["search-master"])
 
@@ -278,6 +288,29 @@ def sm_resolve(req: SMResolveRequest):
     return {"resolved": True, "new_status": "AT-GATE", "decision": "approve",
             "enqueued": False, "routed": "operator-gate",
             "note": "no runnable recipe for this item — routed to its gated flow (needs data/build/broker)."}
+
+
+@sm_router.post("/terminus/llm", dependencies=[Depends(require_operator_identity)])
+def sm_terminus_llm(req: SMTerminusLLMRequest):
+    """LLM passthrough for the engine's TERMINUS. The discovery service holds NO
+    Anthropic key (deny-by-construction) — it POSTs here and the PROXY (which holds
+    the key in its service env) makes the one Anthropic call. READ-ONLY: no state or
+    graph write, exactly like the analyst path."""
+    import sm_analyst
+    return sm_analyst.raw(req.system, req.user, req.max_tokens)
+
+
+@sm_router.post("/reevaluate", dependencies=[Depends(require_operator_identity)])
+def sm_reevaluate(req: SMReevaluateRequest):
+    """Enqueue a RE-TERMINUS job (the operator's Re-evaluate / deliberate-review click)
+    for a concluded board item. The ENGINE re-judges its OWN stored work with the fixed
+    taxonomy + LLM; this endpoint only writes a run-REQUEST (the runner does the work,
+    streaming to the In-progress tab). FIREWALL: no probe, no buy, no trading instance."""
+    try:
+        run_queue, _ = _sm_engine()
+        return run_queue.enqueue_reterminus(req.item_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"engine unavailable: {e}")
 
 
 @sm_router.get("/probe/status", dependencies=[Depends(require_operator_identity)])

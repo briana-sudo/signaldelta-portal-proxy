@@ -90,6 +90,22 @@ def _call_anthropic(system: str, history: list[dict], question: str, key: str) -
     return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
 
 
+def raw(system: str, user: str, max_tokens: int = 1024) -> dict[str, Any]:
+    """RAW LLM passthrough for the engine's terminus (the discovery service holds no
+    Anthropic key; the PROXY does). One Anthropic call, no state/graph write. Returns
+    {text} or {text:None, reason} — honest, never raises."""
+    key = _anthropic_key()
+    if not key:
+        return {"text": None, "reason": "no-key"}
+    try:
+        text = _call_anthropic(system, [], user, key)
+        return {"text": text, "model": _MODEL}
+    except urllib.error.HTTPError as e:
+        return {"text": None, "reason": f"api-{e.code}"}
+    except Exception as e:
+        return {"text": None, "reason": type(e).__name__}
+
+
 def answer(question: str, history: list[dict], state: dict[str, Any]) -> dict[str, Any]:
     """Grounded LLM answer. Honest fallback (never an empty shell) on missing key or
     API error. Returns {kind, explanation, grounded, model}."""
