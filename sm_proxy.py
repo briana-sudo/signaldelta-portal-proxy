@@ -212,7 +212,6 @@ def sm_readmodel():
         }
 
 
-import re as _re
 import sys as _sys
 
 
@@ -224,38 +223,34 @@ def _sm_engine():
     return run_queue, recipe_registry
 
 
-def _recipe_id_for(gate_item_id: str) -> str | None:
-    """Extract a candidate id (e.g. V-015) from a board item id, if it has a recipe."""
-    m = _re.search(r"V-0\d\d", gate_item_id or "")
-    return m.group(0) if m else None
-
-
 @sm_router.post("/resolve", dependencies=[Depends(require_operator_identity)])
 def sm_resolve(req: SMResolveRequest):
-    """Approve/Hold on a board item. For a RUNNABLE-NOW candidate that has a recipe,
-    Approve ENQUEUES the recipe run (SMRunRequest, status=queued) — the discovery
-    engine picks it up and runs it one-at-a-time. Hold parks it. Other tiers route to
-    their gated flow (surfaced, not run).
+    """Approve/Hold on a board item. Approve on a runnable candidate ENQUEUES ALL of
+    its COMPONENT recipe runs (e.g. V-015 -> its 3 flows), one-at-a-time; the item
+    disposes fully only when every component concludes. Hold parks it; other tiers
+    route to their gated flow (surfaced, not run).
 
-    FIREWALL: this only writes a run-REQUEST or a hold — it never runs the probe,
+    FIREWALL: this only writes run-REQUESTS or a hold — it never runs the probe,
     buys, or onboards. The RUNNER (in SignalDeltaDiscovery) does the research."""
     decision = str(req.decision).lower()
     if decision in ("reject", "hold"):
         return {"resolved": True, "new_status": "HELD", "decision": "hold", "held": True}
 
-    recipe_id = _recipe_id_for(req.gate_item_id)
     try:
         run_queue, registry = _sm_engine()
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"engine unavailable: {e}")
 
-    if recipe_id and registry.has_recipe(recipe_id):
+    comps = registry.components_for(req.gate_item_id)
+    if comps:
         try:
-            res = run_queue.enqueue(req.gate_item_id, recipe_id, title=recipe_id)
+            states = [run_queue.enqueue(req.gate_item_id, rid,
+                                        title=registry.get_recipe(rid)["name"]).get("state")
+                      for rid in comps]
         except Exception as e:                        # 7688 down → honest 503
             raise HTTPException(status_code=503, detail=f"queue write failed: {e}")
         return {"resolved": True, "new_status": "QUEUED", "decision": "approve",
-                "enqueued": True, "recipe_id": recipe_id, "state": res.get("state")}
+                "enqueued": True, "components": comps, "states": states}
     # non-runnable / no recipe → routed to the operator gate (surfaced, not run)
     return {"resolved": True, "new_status": "AT-GATE", "decision": "approve",
             "enqueued": False, "routed": "operator-gate",
