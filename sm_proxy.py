@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 
 from sm_cypher_allowlist import is_read_shaped
 from sm_engine import engine_start, engine_status, engine_stop
-from sm_proxy_control import proxy_restart, proxy_start, proxy_status, proxy_stop
+from sm_proxy_control import helper_available, proxy_restart, proxy_start, proxy_status, proxy_stop
 from sm_secrets import SecretsStore
 
 # --- 7688 isolation: the search-master pool reaches ONLY 7688 ----------------
@@ -266,8 +266,10 @@ def sm_engine_stop():
 def sm_proxy_status():
     """running | starting | stopping | stopped | not-installed (for the button).
     While a restart is in flight this endpoint is briefly unreachable — the button
-    reads that as 'restarting' and polls until it answers 'running' again."""
-    return {"status": proxy_status()}
+    reads that as 'restarting' and polls until it answers 'running' again.
+    `helper_backed` = the always-on SM_ProxyHelper is up, so a restart works even
+    for the first restart after a proxy code change."""
+    return {"status": proxy_status(), "helper_backed": helper_available()}
 
 
 @sm_router.post("/proxy/restart", dependencies=[Depends(require_operator_identity)])

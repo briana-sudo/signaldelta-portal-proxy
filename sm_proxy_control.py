@@ -13,14 +13,19 @@ auth as every other /sm/* endpoint.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import urllib.request
 from pathlib import Path
 
 PROXY_SERVICE = os.environ.get("SM_PROXY_SERVICE", "SignalDeltaProxy")
 RESTART_TASK = os.environ.get("SM_PROXY_RESTART_TASK", "SM_ProxyRestart")
 _NSSM = os.environ.get("SM_NSSM_PATH", r"C:\SignalDelta_Local\tools\nssm.exe")
 _RESTART_CMD = Path(__file__).with_name("restart_proxy.cmd")
+# the always-on helper service (SM_ProxyHelper) — the PRIMARY restart path now
+_HELPER_URL = os.environ.get("SM_HELPER_URL", "http://127.0.0.1:8199")
+_HELPER_TOKEN = os.environ.get("SM_HELPER_TOKEN")
 _TIMEOUT = 25
 
 
@@ -64,13 +69,42 @@ def _ensure_restart_task() -> None:
         capture_output=True, text=True, timeout=_TIMEOUT)
 
 
+def _call_helper(path: str) -> bool:
+    """Ask the always-on SM_ProxyHelper to cycle the proxy. Returns True if the
+    helper accepted the request. The helper is a separate service, so it restarts
+    the proxy from OUTSIDE the proxy's process tree — clean and code-independent."""
+    try:
+        headers = {"Content-Type": "application/json"}
+        if _HELPER_TOKEN:
+            headers["X-Helper-Token"] = _HELPER_TOKEN
+        req = urllib.request.Request(f"{_HELPER_URL}{path}", data=b"{}", headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=6) as r:
+            return r.status in (200, 202)
+    except Exception:
+        return False
+
+
+def helper_available() -> bool:
+    try:
+        with urllib.request.urlopen(f"{_HELPER_URL}/helper/health", timeout=4) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
 def proxy_restart() -> str:
-    """Kick off a clean out-of-tree restart of the proxy service and return
-    immediately ('restarting'). The scheduled task does: brief pause (let this HTTP
-    response flush) → nssm/sc restart → service back with live /sm/readmodel."""
+    """Restart the proxy service and return immediately ('restarting').
+
+    PRIMARY: hand off to the always-on SM_ProxyHelper (out-of-tree, survives the
+    proxy dying, works even mid-code-change). FALLBACK: the one-shot scheduled task,
+    if the helper isn't installed yet. Either way the response flushes before the
+    proxy drops, then it comes back with live /sm/readmodel."""
     st = proxy_status()
     if st == "not-installed":
         return "not-installed"
+    if _call_helper("/helper/restart"):
+        return "restarting"
+    # fallback — no helper yet: the out-of-tree scheduled task
     _ensure_restart_task()
     subprocess.run(["schtasks", "/Run", "/TN", RESTART_TASK],
                    capture_output=True, text=True, timeout=_TIMEOUT)
