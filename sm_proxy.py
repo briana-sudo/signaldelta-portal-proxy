@@ -224,6 +224,14 @@ def sm_readmodel():
             # revival monitor state + recheck-scan history (the Timeline's live source)
             "watches": rows("SMWatch"),
             "scan_history": rows("SMScan", order=" ORDER BY n.at DESC"),
+            # TERMINUS combiner outputs: per-run return streams + pairwise rho graph
+            "streams": rows("SMReturnStream"),
+            "correlations": [
+                {"from": r["a"], "to": r["b"], "rho": r["rho"], "n_overlap": r["n"]}
+                for r in session.run(
+                    f"MATCH (a:SMReturnStream)-[c:CORRELATES_WITH]->(b:SMReturnStream) "
+                    f"WHERE {_BRANCH_ISOLATION} RETURN a.id AS a, b.id AS b, c.rho AS rho, c.n_overlap AS n")
+            ],
         }
 
 
@@ -343,7 +351,7 @@ def sm_analyst_ask(req: SMAnalystRequest):
     """Grounded LLM answer (read-only): assembles the state+corpus+lessons pack
     server-side and calls the Anthropic API. Honest fallback (never empty) on missing
     key/API error. FIREWALL: the analyst path holds NO write capability — it reads
-    state and calls the LLM; it never resolves, onboards, banks, or touches 7687."""
+    state and calls the LLM; it never resolves, onboards, banks, or reaches the trading instance."""
     import sm_analyst
     return sm_analyst.answer(req.ask, req.history or [], _analyst_state())
 
