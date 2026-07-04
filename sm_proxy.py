@@ -257,9 +257,11 @@ def sm_research(req: SMResearchRequest):
     return sm_costing.research(req.surface_id, req.surface)
 
 
-# --- ENGINE POWER SWITCH (§ finish: start/stop/status of the engine service) ---
-# Controls the SignalDeltaEngine Windows SERVICE. This is a power switch, NOT a
-# research action — it does not bypass the firewall; the engine's gates still gate.
+# --- DISCOVERY-ENGINE POWER SWITCH (start/stop/status of the discovery service) ---
+# Controls the search-master discovery service ONLY (hardcoded in sm_engine as
+# SignalDeltaDiscovery — no service-name parameter exists anywhere in this path, so
+# it can never address the production trading engine). Power switch, not a research
+# action — it does not bypass the firewall; the engine's gates still gate.
 @sm_router.get("/engine/status", dependencies=[Depends(require_operator_identity)])
 def sm_engine_status():
     """running | starting | stopping | stopped | not-installed (for the button)."""

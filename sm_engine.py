@@ -1,25 +1,35 @@
-"""Search-master ENGINE POWER SWITCH — start/stop/status of the SignalDeltaEngine
-Windows service, for the Discovery portal's topbar button.
+"""Discovery-engine POWER SWITCH — start/stop/status of the SEARCH-MASTER discovery
+service (SignalDeltaDiscovery), for the Discovery portal's topbar button.
+
+DENY-BY-CONSTRUCTION FIREWALL: the target service is a HARDCODED module constant.
+There is deliberately NO parameter, no env override, and no argument on any control
+function or route by which a caller could address a different service. A capability
+that doesn't exist can't be misrouted — the console can never reach the production
+trading engine. (Mirrors SM_ProxyHelper, which is restart-only and hardcoded to
+SignalDeltaProxy.)
 
 This controls the SERVICE (a power switch); it does NOT bypass the research
-firewall. Starting the engine service just lets the engine run its gated loop;
-stopping it turns the loop off. Nothing here grades, decides, trades, or resolves
-a gate — the engine's operator gates still gate every research action. (Same
-`require_operator_identity` auth as every other /sm/* endpoint.)
+firewall. Starting the discovery service just lets the search-master loop run its
+gated cycle; stopping it turns the loop off. Nothing here grades, decides, trades,
+or resolves a gate. (Same `require_operator_identity` auth as every other /sm/*.)
 """
 from __future__ import annotations
 
-import os
 import subprocess
 
-ENGINE_SERVICE = os.environ.get("SM_ENGINE_SERVICE", "SignalDeltaEngine")
+# HARDCODED — the ONLY service this module can address. No env override, no default
+# to any other service. Changing the target requires editing this line (a code +
+# review change), not flipping an env var or passing an argument.
+DISCOVERY_SERVICE = "SignalDeltaDiscovery"
 _TIMEOUT = 20
 
 
-def _sc(*args: str) -> subprocess.CompletedProcess:
-    # sc.exe is the Windows service controller; the proxy service account (NSSM
-    # LocalSystem) can start/stop another service.
-    return subprocess.run(["sc.exe", *args], capture_output=True, text=True, timeout=_TIMEOUT)
+def _sc(action: str) -> subprocess.CompletedProcess:
+    """Run `sc.exe <action> SignalDeltaDiscovery`. The service name is fixed here —
+    the ONLY caller-controlled input is the action verb (query/start/stop), never a
+    service name."""
+    return subprocess.run(["sc.exe", action, DISCOVERY_SERVICE],
+                          capture_output=True, text=True, timeout=_TIMEOUT)
 
 
 def classify_state(text: str) -> str:
@@ -39,39 +49,37 @@ def classify_state(text: str) -> str:
 
 def engine_status() -> str:
     """running | starting | stopping | stopped | not-installed. Reads the live
-    service state (`sc query`) — the source of truth for the button."""
+    SignalDeltaDiscovery state (`sc query`) — the source of truth for the button."""
     try:
-        out = _sc("query", ENGINE_SERVICE)
+        out = _sc("query")
     except Exception:
         return "unknown"
     return classify_state((out.stdout or "") + (out.stderr or ""))
 
 
 def engine_start() -> str:
-    """Start the engine service (idempotent — already-running is fine). Returns the
-    resulting status (typically 'starting' → 'running')."""
+    """Start the discovery service (idempotent). Returns the resulting status."""
     st = engine_status()
     if st == "not-installed":
         return "not-installed"
     if st in ("running", "starting"):
         return st
     try:
-        _sc("start", ENGINE_SERVICE)          # returns immediately with START_PENDING
+        _sc("start")                          # returns immediately with START_PENDING
     except Exception:
         return "unknown"
     return engine_status()
 
 
 def engine_stop() -> str:
-    """Stop the engine service cleanly (NSSM turns this into the graceful shutdown
-    the run_service loop handles). Idempotent — already-stopped is fine."""
+    """Stop the discovery service cleanly (NSSM → graceful shutdown). Idempotent."""
     st = engine_status()
     if st == "not-installed":
         return "not-installed"
     if st in ("stopped", "stopping"):
         return st
     try:
-        _sc("stop", ENGINE_SERVICE)
+        _sc("stop")
     except Exception:
         return "unknown"
     return engine_status()
