@@ -212,21 +212,66 @@ def sm_readmodel():
         }
 
 
+import re as _re
+import sys as _sys
+
+
+def _sm_engine():
+    """Import the search-master engine (queue + recipe registry) once."""
+    if r"C:\SignalDelta_Local" not in _sys.path:
+        _sys.path.insert(0, r"C:\SignalDelta_Local")
+    from searchmaster.engine import recipe_registry, run_queue
+    return run_queue, recipe_registry
+
+
+def _recipe_id_for(gate_item_id: str) -> str | None:
+    """Extract a candidate id (e.g. V-015) from a board item id, if it has a recipe."""
+    m = _re.search(r"V-0\d\d", gate_item_id or "")
+    return m.group(0) if m else None
+
+
 @sm_router.post("/resolve", dependencies=[Depends(require_operator_identity)])
-def sm_resolve(req: SMResolveRequest, operator: str = Depends(require_operator_identity)):
-    """The ONLY write path (§4). This endpoint holds the ONLY write-mode session on
-    the search-master surface (server-side). It forwards the operator's INTENT to
-    the orchestrator's gate-resolution (3a ``OperatorGateQueue.resolve`` via the
-    engine, the §4.1 contract) — it never writes the graph from a browser payload.
-    The write-mode 7688 session is opened ONLY here; every other endpoint is READ."""
-    driver = get_sm_driver()                      # 503 until 7688 provisioned
-    # The gate-resolution logic lives in the engine (3d-i ResolveAPI → 3a). On a
-    # live system this applies through the 7688 write principal / Phase-0
-    # propagation; the write-mode session below is the ONLY write session on this
-    # surface. (Engine wiring is the config swap once 7688 + the run-loop are live.)
-    with driver.session(database=SM_NEO4J_DATABASE, default_access_mode="WRITE"):
-        raise HTTPException(status_code=501,
-                            detail="resolve transport ready; engine gate-resolution binding is the 7688 config swap (operator step)")
+def sm_resolve(req: SMResolveRequest):
+    """Approve/Hold on a board item. For a RUNNABLE-NOW candidate that has a recipe,
+    Approve ENQUEUES the recipe run (SMRunRequest, status=queued) — the discovery
+    engine picks it up and runs it one-at-a-time. Hold parks it. Other tiers route to
+    their gated flow (surfaced, not run).
+
+    FIREWALL: this only writes a run-REQUEST or a hold — it never runs the probe,
+    buys, or onboards. The RUNNER (in SignalDeltaDiscovery) does the research."""
+    decision = str(req.decision).lower()
+    if decision in ("reject", "hold"):
+        return {"resolved": True, "new_status": "HELD", "decision": "hold", "held": True}
+
+    recipe_id = _recipe_id_for(req.gate_item_id)
+    try:
+        run_queue, registry = _sm_engine()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"engine unavailable: {e}")
+
+    if recipe_id and registry.has_recipe(recipe_id):
+        try:
+            res = run_queue.enqueue(req.gate_item_id, recipe_id, title=recipe_id)
+        except Exception as e:                        # 7688 down → honest 503
+            raise HTTPException(status_code=503, detail=f"queue write failed: {e}")
+        return {"resolved": True, "new_status": "QUEUED", "decision": "approve",
+                "enqueued": True, "recipe_id": recipe_id, "state": res.get("state")}
+    # non-runnable / no recipe → routed to the operator gate (surfaced, not run)
+    return {"resolved": True, "new_status": "AT-GATE", "decision": "approve",
+            "enqueued": False, "routed": "operator-gate",
+            "note": "no runnable recipe for this item — routed to its gated flow (needs data/build/broker)."}
+
+
+@sm_router.get("/probe/status", dependencies=[Depends(require_operator_identity)])
+def sm_probe_status():
+    """Live run state for the In-progress tab: the currently-running probe (with its
+    stage-by-stage progress), the queue in order, and recent finished runs — read
+    from 7688 so a browser refresh survives."""
+    try:
+        run_queue, _ = _sm_engine()
+        return run_queue.status()
+    except Exception:
+        return {"running": None, "queue": [], "done": []}
 
 
 @sm_router.post("/onboard", dependencies=[Depends(require_operator_identity)])
