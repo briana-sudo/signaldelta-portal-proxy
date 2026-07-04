@@ -234,6 +234,9 @@ def sm_readmodel():
             # revival monitor state + recheck-scan history (the Timeline's live source)
             "watches": rows("SMWatch"),
             "scan_history": rows("SMScan", order=" ORDER BY n.at DESC"),
+            # every run (probe / component / re-terminus) with its stage progress,
+            # result, disposition record + report version history — the Run Room source
+            "runs": rows("SMRunRequest"),
             # TERMINUS combiner outputs: per-run return streams + pairwise rho graph
             "streams": rows("SMReturnStream"),
             "correlations": [
