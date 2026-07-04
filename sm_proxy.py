@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 
 from sm_cypher_allowlist import is_read_shaped
 from sm_engine import engine_start, engine_status, engine_stop
+from sm_proxy_control import proxy_restart, proxy_start, proxy_status, proxy_stop
 from sm_secrets import SecretsStore
 
 # --- 7688 isolation: the search-master pool reaches ONLY 7688 ----------------
@@ -256,6 +257,35 @@ def sm_engine_start():
 @sm_router.post("/engine/stop", dependencies=[Depends(require_operator_identity)])
 def sm_engine_stop():
     return {"action": "stop", "status": engine_stop()}
+
+
+# Controls the SignalDeltaProxy Windows SERVICE (the surface the portal talks to).
+# A power switch, NOT a research/trade action — same auth, no firewall change. The
+# restart is what's needed after a deploy so /sm/readmodel serves live 7688 data.
+@sm_router.get("/proxy/status", dependencies=[Depends(require_operator_identity)])
+def sm_proxy_status():
+    """running | starting | stopping | stopped | not-installed (for the button).
+    While a restart is in flight this endpoint is briefly unreachable — the button
+    reads that as 'restarting' and polls until it answers 'running' again."""
+    return {"status": proxy_status()}
+
+
+@sm_router.post("/proxy/restart", dependencies=[Depends(require_operator_identity)])
+def sm_proxy_restart():
+    """Cleanly restart the proxy service via an out-of-tree scheduled task. Returns
+    immediately with 'restarting'; the service cycles and comes back with live
+    /sm/readmodel. (This is the click that makes 'restart the proxy' terminal-free.)"""
+    return {"action": "restart", "status": proxy_restart()}
+
+
+@sm_router.post("/proxy/stop", dependencies=[Depends(require_operator_identity)])
+def sm_proxy_stop():
+    return {"action": "stop", "status": proxy_stop()}
+
+
+@sm_router.post("/proxy/start", dependencies=[Depends(require_operator_identity)])
+def sm_proxy_start():
+    return {"action": "start", "status": proxy_start()}
 
 
 @sm_router.get("/health", dependencies=[Depends(require_operator_identity)])
