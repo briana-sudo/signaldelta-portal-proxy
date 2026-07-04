@@ -198,6 +198,33 @@ def sm_export(req: SMQueryRequest):
     return {"rows": rows, "row_count": len(rows)}
 
 
+# ── running-commit visibility (RESTART != DEPLOY root fix) ───────────────────
+# Capture the git HEAD at IMPORT time = the commit this process is actually running.
+# Compared live to the tree HEAD, so "is the new code live?" is answerable directly:
+# running != tree  ⇒  the disk has newer code than this process ⇒ STALE (update+restart).
+import subprocess as _subp
+
+_PROXY_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _git_short(ref: str = "HEAD") -> str | None:
+    try:
+        r = _subp.run(["git", "-C", _PROXY_DIR, "rev-parse", "--short", ref],
+                      capture_output=True, text=True, timeout=5)
+        return (r.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
+_RUNNING_COMMIT = _git_short("HEAD")            # frozen at process start
+
+
+def _commit_state() -> dict[str, Any]:
+    tree = _git_short("HEAD")
+    return {"running_commit": _RUNNING_COMMIT, "tree_commit": tree,
+            "stale": bool(_RUNNING_COMMIT and tree and _RUNNING_COMMIT != tree)}
+
+
 def _surface_of(parent_or_id: str) -> str:
     """Coverage surface for a run/board id: 'new-search-surface:V-015#V-015-TDF' -> 'V-015'."""
     p = str(parent_or_id or "").split("#")[0]
@@ -502,8 +529,33 @@ def sm_proxy_status():
     While a restart is in flight this endpoint is briefly unreachable — the button
     reads that as 'restarting' and polls until it answers 'running' again.
     `helper_backed` = the always-on SM_ProxyHelper is up, so a restart works even
-    for the first restart after a proxy code change."""
-    return {"status": proxy_status(), "helper_backed": helper_available()}
+    for the first restart after a proxy code change. running_commit/tree_commit/stale
+    make 'is the new code live?' answerable directly (never again only by behavior)."""
+    return {"status": proxy_status(), "helper_backed": helper_available(), **_commit_state()}
+
+
+def _git_update() -> dict[str, Any]:
+    """Fast-forward the service tree to the designated deploy branch (SM_DEPLOY_BRANCH,
+    default 'main'). Best-effort; ff-only so it never rewrites/loses local state."""
+    branch = os.environ.get("SM_DEPLOY_BRANCH", "main")
+    try:
+        _subp.run(["git", "-C", _PROXY_DIR, "fetch", "--quiet", "origin", branch], timeout=40)
+        r = _subp.run(["git", "-C", _PROXY_DIR, "merge", "--ff-only", f"origin/{branch}"],
+                      capture_output=True, text=True, timeout=40)
+        return {"branch": branch, "ok": r.returncode == 0,
+                "detail": ((r.stdout or "") + (r.stderr or "")).strip()[:200], "tree_commit": _git_short("HEAD")}
+    except Exception as e:
+        return {"branch": branch, "ok": False, "detail": f"{type(e).__name__}: {e}"}
+
+
+@sm_router.post("/proxy/update-restart", dependencies=[Depends(require_operator_identity)])
+def sm_proxy_update_restart():
+    """UPDATE & RESTART — the fix for 'restart != deploy'. Fast-forwards the service
+    tree to the deploy branch FIRST, then restarts via the helper, so the running
+    process picks up the latest code (not just cycles the old code). The topbar's
+    running_commit reflects the new commit once it comes back."""
+    update = _git_update()
+    return {"action": "update-restart", "update": update, "status": proxy_restart()}
 
 
 @sm_router.post("/proxy/restart", dependencies=[Depends(require_operator_identity)])
