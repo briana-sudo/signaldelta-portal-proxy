@@ -131,6 +131,12 @@ class SMOnboardRequest(BaseModel):
     content_hash: str = ""
 
 
+class SMResearchRequest(BaseModel):
+    surface_id: str
+    surface: str = ""
+    kind: str = "price-research"
+
+
 # --- the router --------------------------------------------------------------
 sm_router = APIRouter(prefix="/sm", tags=["search-master"])
 
@@ -238,6 +244,17 @@ def sm_onboard(req: SMOnboardRequest):
             "configured": configured or _secrets.configured(f"{req.source_id}_api_key"),
             "watermark": req.watermark, "version_hash": req.content_hash,
             "note": "credential stored server-side (out-of-band); engine validate/register runs on the 7688 config swap"}
+
+
+# --- COSTING WORKER (Part B) — "Price it / Research" fills the Data-needs fields ---
+@sm_router.post("/research", dependencies=[Depends(require_operator_identity)])
+def sm_research(req: SMResearchRequest):
+    """Research the real cost of a gated surface (vendor, cost/yr, monthly, terms,
+    tiers, what-you-get) and return filled fields + the operator's judgment-call
+    questions. FIREWALL: researches + fills only — NEVER buys, onboards, or spends;
+    Approve stays the operator's. (No onboard/resolve/secrets call in this path.)"""
+    import sm_costing
+    return sm_costing.research(req.surface_id, req.surface)
 
 
 # --- ENGINE POWER SWITCH (§ finish: start/stop/status of the engine service) ---
