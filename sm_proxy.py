@@ -242,8 +242,11 @@ def sm_readmodel():
             "correlations": [
                 {"from": r["a"], "to": r["b"], "rho": r["rho"], "n_overlap": r["n"]}
                 for r in session.run(
-                    f"MATCH (a:SMReturnStream)-[c:CORRELATES_WITH]->(b:SMReturnStream) "
-                    f"WHERE {_BRANCH_ISOLATION} RETURN a.id AS a, b.id AS b, c.rho AS rho, c.n_overlap AS n")
+                    # NOTE: this query aliases nodes a/b (not n), so the branch-isolation
+                    # filter must reference a/b — SMReturnStream is SM-only anyway.
+                    "MATCH (a:SMReturnStream)-[c:CORRELATES_WITH]->(b:SMReturnStream) "
+                    "WHERE NOT a:KCCNode AND NOT a:KTMNode AND NOT b:KCCNode AND NOT b:KTMNode "
+                    "RETURN a.id AS a, b.id AS b, c.rho AS rho, c.n_overlap AS n")
             ],
         }
 
