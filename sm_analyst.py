@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -21,7 +20,6 @@ from typing import Any
 _ROOT = Path(r"C:\SignalDelta_Local")
 _SEED = _ROOT / "searchmaster" / "seed" / "ENGINE_SEED_STATE.md"
 _CORPUS = _ROOT / "searchmaster" / "corpus" / "ABANDONMENT_CORPUS_canonical_v0_2.md"
-_ENV_FILES = (_ROOT / "signaldelta-portal-proxy" / ".env", _ROOT / ".env")
 _MODEL = os.environ.get("SM_ANALYST_MODEL", "claude-sonnet-4-6")
 _MAX_CHARS = 30000                                    # cap each corpus doc in the pack
 
@@ -40,19 +38,11 @@ _FALLBACK = ("I can't answer that with the analyst LLM right now (the server-sid
 
 
 def _anthropic_key() -> str | None:
-    for n in ("ANTHROPIC_API_KEY", "anthropic_api_key"):
-        v = os.environ.get(n)
-        if v:
-            return v
-    for f in _ENV_FILES:
-        try:
-            for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
-                m = re.match(r"^\s*(ANTHROPIC_API_KEY|anthropic_api_key)\s*=\s*(.+?)\s*$", line)
-                if m:
-                    return m.group(2)
-        except FileNotFoundError:
-            pass
-    return None
+    """Read the key from the SignalDeltaProxy SERVICE ENV ONLY (os.environ). There is
+    NO .env file read here — deny-by-construction, so this module can never open the
+    trading engine's .env. Key absent → the caller returns the honest fallback.
+    (`Setup Proxy Key.bat` injects the key into the proxy service env, machine-side.)"""
+    return os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("anthropic_api_key")
 
 
 def _read(path: Path) -> str:

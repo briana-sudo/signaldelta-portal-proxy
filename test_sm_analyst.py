@@ -24,6 +24,10 @@ class AnalystFirewallTest(unittest.TestCase):
             self.assertNotIn(bad, src, f"analyst must not call {bad}")
         # (3) the only outbound target is the Anthropic API
         self.assertIn("api.anthropic.com", src)
+        # (4) NO trading-.env crossing: no _ENV_FILES, no read of the trading root .env
+        self.assertNotIn("_ENV_FILES", src)
+        self.assertNotIn('_ROOT / ".env"', src)  # no trading root .env path
+
 
     def test_fallback_is_honest_not_empty(self):
         orig = sm_analyst._anthropic_key

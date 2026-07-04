@@ -62,7 +62,7 @@ from queries import (
     effective_forensic_ids,
 )
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))  # PROXY .env ONLY — never search up to the trading .env
 
 PROXY_API_TOKEN = os.environ.get("PROXY_API_TOKEN")
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
