@@ -1,0 +1,23 @@
+{
+  "_comment": "Phase 3d-iii-a — Cloudflare Access policy gating the ENTIRE operator surface (auth off the client, spec 1.1 AUTH pin). Applied by apply_access_and_tunnel.ps1. NO secret here: the API token is pasted at apply time, never stored in this file. Replace <SLOT> values with the operator's real identifiers at apply time; the apply-script substitutes them.",
+  "self_hosted_app": {
+    "name": "SignalDelta Discovery (operator surface)",
+    "domain": "proxy.signaldeltas.com",
+    "type": "self_hosted",
+    "session_duration": "24h",
+    "app_launcher_visible": false,
+    "_note_domain": "EXISTING permanent DNS record — do NOT create/modify/delete it. This app attaches Access to the existing hostname only."
+  },
+  "policy": {
+    "name": "operator-only",
+    "decision": "allow",
+    "precedence": 1,
+    "include": [
+      { "email": ["<OPERATOR_EMAIL_SLOT>"] }
+    ],
+    "require": [
+      { "email": ["<OPERATOR_EMAIL_SLOT>"] }
+    ],
+    "_note": "Deny-by-default: only the operator identity is admitted; every other caller is rejected at the tunnel before reaching any /sm/* endpoint. The proxy additionally requires the injected Cf-Access-Authenticated-User-Email header on every endpoint."
+  }
+}

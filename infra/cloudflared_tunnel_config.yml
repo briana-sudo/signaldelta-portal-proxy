@@ -1,0 +1,19 @@
+# Phase 3d-iii-a — ingress edit for the EXISTING named tunnel (do NOT create a new
+# tunnel, do NOT change DNS). This adds/keeps the operator-surface hostname routing
+# to the local proxy. apply_access_and_tunnel.ps1 merges this ingress into the
+# operator's existing tunnel config; it never touches the DNS record for
+# proxy.signaldeltas.com (permanent) or deletes the named tunnel.
+#
+# <TUNNEL_ID_SLOT> and the credentials-file path are the operator's existing values
+# (the apply-script reads them from the current config; it does not mint new ones).
+
+tunnel: <TUNNEL_ID_SLOT>
+credentials-file: <EXISTING_TUNNEL_CREDENTIALS_PATH_SLOT>
+
+ingress:
+  # operator surface — proxied to the local FastAPI proxy (7687 + /sm/* 7688 route
+  # group). Cloudflare Access (cloudflare_access.json) gates this hostname.
+  - hostname: proxy.signaldeltas.com
+    service: http://localhost:8000
+  # required catch-all (cloudflared requires a terminal rule)
+  - service: http_status:404

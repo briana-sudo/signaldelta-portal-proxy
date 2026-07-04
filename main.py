@@ -165,6 +165,14 @@ app.add_middleware(
     max_age=86400,
 )
 
+# ─── Phase 3d-iii-a: search-master (7688) operator-surface route group ────────
+# Additive + ISOLATED — a SEPARATE 7688 pool (never touches the 7687 `_driver`
+# above), auth off the client (Cloudflare Access), read-only via the whitelist
+# allowlist + read-mode sessions, resolve = the only write-mode session. See
+# sm_proxy.py. The 7687 trading-engine endpoints below are untouched.
+from sm_proxy import sm_router  # noqa: E402  (kept next to its mount for isolation)
+app.include_router(sm_router)
+
 
 # ─── Auth ─────────────────────────────────────────────────────────────────
 def require_bearer(authorization: str | None = Header(default=None)) -> None:
@@ -558,6 +566,91 @@ def storm_pull(req: PullRequest):
     return JSONResponse(status_code=202, content={
         "status": "accepted", "job_id": job_id, "date": req.date,
         "center": [req.lat, req.lon], "radius_mi": radius})
+
+
+# ─── TEMPEST spend-dial + intraday-approve endpoints (2026-06-28) ────────────
+# Same seam as /storm_pull: the proxy stays a thin auth gate and shells out to the storm
+# engine's OWN venv CLI (storm.portal_api), which reuses spend_dial/notify. Read endpoints
+# (-solve / approve-validate) use the read bearer; write endpoints (-approve / push / approve)
+# use the SEPARATE write token. These are SYNCHRONOUS (solve/approve are seconds, unlike the
+# 30s grib decode behind /storm_pull) — they print one JSON line we pass straight through.
+SPEND_CLI_TIMEOUT = 150
+
+
+def _run_engine_cli(command: str, payload: dict) -> dict:
+    """Invoke `python -m storm.portal_api <command> --json <payload>` in the engine venv and
+    return the parsed last JSON line. The engine is the single source of the solve/approve."""
+    if not os.path.exists(STORM_ENGINE_PY):
+        raise HTTPException(status_code=503, detail="storm engine venv not found on host")
+    try:
+        proc = subprocess.run(
+            [STORM_ENGINE_PY, "-m", "storm.portal_api", command, "--json", json.dumps(payload)],
+            cwd=STORM_ENGINE_ROOT, env={**os.environ, "PYTHONPATH": STORM_ENGINE_ROOT},
+            capture_output=True, text=True, timeout=SPEND_CLI_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail=f"engine {command} timed out")
+    lines = [ln for ln in (proc.stdout or "").strip().splitlines() if ln.strip()]
+    if not lines:
+        raise HTTPException(status_code=500, detail=f"engine {command} no output: {(proc.stderr or '')[:300]}")
+    try:
+        return json.loads(lines[-1])
+    except Exception:
+        raise HTTPException(status_code=500, detail=f"engine {command} bad output: {lines[-1][:300]}")
+
+
+class SpendSolveReq(BaseModel):
+    date: str
+    area_setting: str = "core_plus"
+    spend_cap: float = 10000.0
+    value_floor: float = 0.0
+    peril: str = "hail"
+    footprint_source: str = "canonical"
+    phase: str = "SURGE"
+    window: dict | None = None
+    target_jobs: int | None = None
+    remaining_annual_capacity: int | None = None
+
+
+class SpendApproveReq(SpendSolveReq):
+    bid_strategy: str = "target_impression_share"
+    actor: str = "operator"
+    campaign_id: str | None = None
+
+
+class PushSubReq(BaseModel):
+    subscription: dict
+    operator: str = "brian"
+
+
+class TokenReq(BaseModel):
+    s: str
+    footprint_source: str = "canonical"
+    actor: str = "operator"
+
+
+@app.post("/spend_solve", dependencies=[Depends(require_bearer)])
+def spend_solve(req: SpendSolveReq):
+    return _run_engine_cli("spend-solve", req.dict())          # READ-ONLY (writes nothing)
+
+
+@app.post("/spend_approve", dependencies=[Depends(require_write_bearer)])
+def spend_approve(req: SpendApproveReq):
+    return _run_engine_cli("spend-approve", req.dict())        # the single gate (one record)
+
+
+@app.post("/push", dependencies=[Depends(require_write_bearer)])
+def push_subscribe(req: PushSubReq):
+    return _run_engine_cli("push-subscribe", req.dict())       # off-graph subscription store
+
+
+@app.post("/approve_validate", dependencies=[Depends(require_bearer)])
+def approve_validate(req: TokenReq):
+    return _run_engine_cli("approve-validate", req.dict())     # token -> CORE solve preview (read)
+
+
+@app.post("/approve", dependencies=[Depends(require_write_bearer)])
+def approve_token(req: TokenReq):
+    return _run_engine_cli("approve-token", req.dict())        # deep-link approve (one record)
 
 
 # ─── Portal v1.1 Change 4: GET /macro_news ────────────────────────────────

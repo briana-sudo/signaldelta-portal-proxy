@@ -3,3 +3,4 @@ uvicorn[standard]==0.32.1
 neo4j==5.27.0
 python-dotenv==1.0.1
 pydantic==2.10.3
+tzdata==2026.2          # ET time-bucket for scanner GO; Windows lacks a system zoneinfo DB
