@@ -35,10 +35,18 @@ try {
         if ($t -match '^([A-Za-z0-9_]+)=(.*)$') { $map[$Matches[1]] = $Matches[2] }
     }
     $map["ANTHROPIC_API_KEY"] = $key
-    $nargs = @($SERVICE, "AppEnvironmentExtra")
+    # NOTE: the nssm verb "set" MUST be the first arg, else nssm rejects the whole
+    # command and NOTHING is written (the silent failure this script had before).
+    $nargs = @("set", $SERVICE, "AppEnvironmentExtra")
     foreach ($k in $map.Keys) { $nargs += ("{0}={1}" -f $k, $map[$k]) }
     & $nssm @nargs | Out-Null
-    Write-Host "  ANTHROPIC_API_KEY injected into $SERVICE service env (value hidden)." -ForegroundColor Green
+
+    # VERIFY BY CONTENT: re-read the service env and confirm the key actually landed.
+    # Never trust the write; a malformed nssm call is silent. (Rule 31.)
+    $verify = & $nssm get $SERVICE AppEnvironmentExtra 2>$null
+    $landed = ($verify -join "`n") -match 'ANTHROPIC_API_KEY='
+    if (-not $landed) { throw "nssm did not persist ANTHROPIC_API_KEY (read-back empty). Nothing was changed." }
+    Write-Host "  ANTHROPIC_API_KEY injected into $SERVICE service env and verified (value hidden)." -ForegroundColor Green
 
     Write-Host "[restart] cycling $SERVICE so the analyst picks up the key ..."
     & $nssm restart $SERVICE | Out-Null
