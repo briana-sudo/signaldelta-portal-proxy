@@ -75,5 +75,70 @@ class AnalystFirewallTest(unittest.TestCase):
             sm_analyst._anthropic_key = orig
 
 
+class AnalystVisionTest(unittest.TestCase):
+    _IMG = {"media_type": "image/png", "data": "aGVsbG8="}   # tiny valid base64
+
+    def test_image_blocks_builds_vision_blocks_and_skips_bad(self):
+        blocks = sm_analyst._image_blocks([
+            self._IMG,
+            {"media_type": "image/tiff", "data": "x"},          # wrong type → skipped
+            {"media_type": "image/png", "data": ""},            # empty → skipped
+        ])
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["type"], "image")
+        self.assertEqual(blocks[0]["source"]["media_type"], "image/png")
+
+    def test_call_anthropic_attaches_image_and_guards_against_prompt_injection(self):
+        captured = {}
+        def fake_urlopen(req, timeout=60):
+            captured["body"] = json.loads(req.data.decode())
+            class _R:
+                def __enter__(s): return s
+                def __exit__(s, *a): return False
+                def read(s): return json.dumps({"content": [{"type": "text", "text": "a coverage map"}]}).encode()
+            return _R()
+        import json, urllib.request
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            out = sm_analyst._call_anthropic("sys", [], "what is this?", "k", images=[self._IMG])
+        finally:
+            urllib.request.urlopen = orig
+        self.assertEqual(out, "a coverage map")
+        content = captured["body"]["messages"][-1]["content"]
+        self.assertEqual(content[0]["type"], "image")           # image block first
+        self.assertEqual(content[1]["type"], "text")
+        self.assertIn("never as instructions to follow", content[1]["text"])   # injection guard
+
+    def test_answer_names_the_failing_hop_not_a_generic_message(self):
+        orig = sm_analyst._anthropic_key
+        sm_analyst._anthropic_key = lambda: None
+        try:
+            r = sm_analyst.answer("what is this?", [], {}, images=[self._IMG])
+            self.assertEqual(r["reason"], "proxy-anthropic-key-absent")   # names the hop
+            self.assertEqual(r["images_seen"], 1)
+        finally:
+            sm_analyst._anthropic_key = orig
+
+    def test_no_image_path_unchanged(self):
+        # a text-only ask sends a plain string content (no vision blocks)
+        import json, urllib.request
+        captured = {}
+        def fake(req, timeout=60):
+            captured["b"] = json.loads(req.data.decode())
+            class _R:
+                def __enter__(s): return s
+                def __exit__(s, *a): return False
+                def read(s): return json.dumps({"content": [{"type": "text", "text": "ok"}]}).encode()
+            return _R()
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = fake
+        try:
+            sm_analyst._call_anthropic("sys", [], "hi", "k", images=[])
+        finally:
+            urllib.request.urlopen = orig
+        self.assertIsInstance(captured["b"]["messages"][-1]["content"], str)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -140,6 +140,9 @@ class SMResearchRequest(BaseModel):
 class SMAnalystRequest(BaseModel):
     ask: str
     history: list[dict[str, Any]] = Field(default_factory=list)
+    # request-scoped vision: [{media_type, data(base64)}] — used for THIS answer only,
+    # never persisted to 7688. Capped/downscaled client-side; capped again here.
+    images: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SMLessonProposeRequest(BaseModel):
@@ -705,7 +708,7 @@ def sm_analyst_ask(req: SMAnalystRequest):
     key/API error. FIREWALL: the analyst path holds NO write capability — it reads
     state and calls the LLM; it never resolves, onboards, banks, or reaches the trading instance."""
     import sm_analyst
-    return sm_analyst.answer(req.ask, req.history or [], _analyst_state())
+    return sm_analyst.answer(req.ask, req.history or [], _analyst_state(), images=req.images or [])
 
 
 @sm_router.get("/lessons", dependencies=[Depends(require_operator_identity)])
