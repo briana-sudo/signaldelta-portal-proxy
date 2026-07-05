@@ -225,14 +225,20 @@ _GIT_BINS = ("git", r"C:\Program Files\Git\cmd\git.exe", r"C:\Program Files\Git\
 _VERSION_FILE = os.path.join(_PROXY_DIR, "proxy_version.json")
 
 
+# safe.directory defeats git "dubious ownership" when the LocalSystem service reads a
+# repo owned by the operator account (bit us on the stamp read before). With it, runtime
+# git WORKS under the service account — the process can read its own real tree HEAD.
+_SAFE = ("-c", f"safe.directory={_PROXY_DIR}", "-c", "safe.directory=*")
+
+
 def _git_short(ref: str = "HEAD") -> str | None:
-    """DEV-ONLY fallback. In the LocalSystem service this fails (git dubious-ownership,
-    LocalSystem != repo owner), which is exactly why the stamp file is the primary
-    source. Kept for a developer running the proxy under their own account."""
+    """Read the tree's short commit via git, safe under LocalSystem (safe.directory override
+    + install-path fallback for a service PATH that lacks git). Returns None only if git is
+    truly unavailable."""
     for gitexe in _GIT_BINS:
         try:
-            r = _subp.run([gitexe, "-C", _PROXY_DIR, "rev-parse", "--short", ref],
-                          capture_output=True, text=True, timeout=5)
+            r = _subp.run([gitexe, *_SAFE, "-C", _PROXY_DIR, "rev-parse", "--short", ref],
+                          capture_output=True, text=True, timeout=8)
             out = (r.stdout or "").strip()
             if r.returncode == 0 and out:
                 return out
@@ -242,9 +248,7 @@ def _git_short(ref: str = "HEAD") -> str | None:
 
 
 def _stamped_commit() -> str | None:
-    """The commit stamped into proxy_version.json at deploy/install time (by the repo
-    OWNER, where git works — a post-commit/post-merge hook or Setup). This is the
-    PRIMARY source; NO runtime git under LocalSystem."""
+    """The commit stamped into proxy_version.json (fallback when git is unavailable)."""
     try:
         with open(_VERSION_FILE, encoding="utf-8") as f:
             return (json.load(f) or {}).get("commit") or None
@@ -252,11 +256,31 @@ def _stamped_commit() -> str | None:
         return None
 
 
+def _restamp(commit: str) -> None:
+    """Rewrite proxy_version.json so the chip reflects the ACTUAL running commit. Called at
+    process start (every restart refreshes it) and after an update — so a working deploy can
+    NEVER read as 'behind' from a hook that failed to fire."""
+    try:
+        with open(_VERSION_FILE, "w", encoding="utf-8") as f:
+            json.dump({"commit": commit, "branch": os.environ.get("SM_DEPLOY_BRANCH", "main"),
+                       "stamped_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                       "stamped_by": "process-start"}, f)
+    except Exception:
+        pass
+
+
+import datetime as _dt
+
+
 def _read_commit() -> str | None:
-    return _stamped_commit() or _git_short("HEAD")     # stamp first; git only for dev
+    # git HEAD (safe under LocalSystem now) is the TRUTH — the process launched from this
+    # tree; the stamp is only a fallback for a git-less environment.
+    return _git_short("HEAD") or _stamped_commit()
 
 
-_RUNNING_COMMIT = _read_commit()                # frozen at process start (stamp preferred)
+_RUNNING_COMMIT = _read_commit()                # the commit this process launched from
+if _RUNNING_COMMIT and _RUNNING_COMMIT != _stamped_commit():
+    _restamp(_RUNNING_COMMIT)                    # STAMP-ON-START: refresh the chip to reality
 
 
 _ENGINE_STATE_DIR = r"C:\SignalDelta_Local\searchmaster\state"
@@ -755,18 +779,69 @@ def sm_proxy_status():
     return {"status": proxy_status(), "helper_backed": helper_available(), **_commit_state()}
 
 
+def _git(*args: str, timeout: int = 40):
+    """Run git under the service account (safe.directory + install-path fallback). Returns
+    the CompletedProcess of the first git binary that executed, else None (git absent)."""
+    for gitexe in _GIT_BINS:
+        try:
+            return _subp.run([gitexe, *_SAFE, "-C", _PROXY_DIR, *args],
+                             capture_output=True, text=True, timeout=timeout)
+        except FileNotFoundError:
+            continue
+        except Exception as e:  # noqa: BLE001
+            class _R:  # a synthetic failure result so the caller reports it LOUDLY
+                returncode, stdout, stderr = 127, "", f"{type(e).__name__}: {e}"
+            return _R()
+    return None
+
+
 def _git_update() -> dict[str, Any]:
-    """Fast-forward the service tree to the designated deploy branch (SM_DEPLOY_BRANCH,
-    default 'main'). Best-effort; ff-only so it never rewrites/loses local state."""
+    """Fast-forward the service tree to the deploy branch (SM_DEPLOY_BRANCH, default 'main').
+    ff-only (never rewrites local state) and LOUD: any failure returns ok=false with the real
+    exit code + stderr; a silent no-op is forbidden. Always re-stamps the chip to the actual
+    tree HEAD so a working deploy can never read as 'behind'."""
     branch = os.environ.get("SM_DEPLOY_BRANCH", "main")
-    try:
-        _subp.run(["git", "-C", _PROXY_DIR, "fetch", "--quiet", "origin", branch], timeout=40)
-        r = _subp.run(["git", "-C", _PROXY_DIR, "merge", "--ff-only", f"origin/{branch}"],
-                      capture_output=True, text=True, timeout=40)
-        return {"branch": branch, "ok": r.returncode == 0,
-                "detail": ((r.stdout or "") + (r.stderr or "")).strip()[:200], "tree_commit": _git_short("HEAD")}
-    except Exception as e:
-        return {"branch": branch, "ok": False, "detail": f"{type(e).__name__}: {e}"}
+    out: dict[str, Any] = {"branch": branch, "ok": False}
+    fetch = _git("fetch", "origin", branch)
+    if fetch is None:
+        out["detail"] = "git unavailable on the service PATH (tried install-path fallback)"
+        return out
+    if fetch.returncode != 0:
+        out["detail"] = f"git fetch failed (exit {fetch.returncode}): {(fetch.stderr or '').strip()[:200]}"
+        out["exit_code"] = fetch.returncode
+        return out
+    ab = _git("rev-list", "--left-right", "--count", f"HEAD...origin/{branch}")
+    ahead = behind = None
+    if ab and ab.returncode == 0 and ab.stdout.strip():
+        try:
+            ahead, behind = (int(x) for x in ab.stdout.split())
+        except Exception:
+            pass
+    out.update({"ahead": ahead, "behind": behind})
+    merge = _git("merge", "--ff-only", f"origin/{branch}")
+    tree = _git_short("HEAD")
+    out["tree_commit"] = tree
+    if tree:
+        _restamp(tree)                                # chip = real tree HEAD, always
+    if merge is not None and merge.returncode == 0:
+        out["ok"] = True
+        out["detail"] = (merge.stdout or merge.stderr or "already up to date").strip()[:200]
+    elif ahead and behind:
+        out["detail"] = (f"DIVERGED — local '{branch}' is {ahead} commit(s) ahead and {behind} "
+                         f"behind origin/{branch}; cannot fast-forward. The service tree carries "
+                         f"local commits not on origin — push/reconcile them, or the deploy source "
+                         f"is wrong. (tree HEAD {tree})")
+        out["exit_code"] = merge.returncode if merge else None
+    elif ahead:
+        out["ok"] = True                              # tree is AHEAD of origin → already newer
+        out["detail"] = (f"tree is {ahead} commit(s) AHEAD of origin/{branch} — nothing to pull; "
+                         f"the running code is newer than origin (tree HEAD {tree}).")
+    else:
+        out["detail"] = (f"git merge --ff-only failed (exit "
+                         f"{merge.returncode if merge else '?'}): "
+                         f"{((merge.stderr or merge.stdout) if merge else '').strip()[:200]}")
+        out["exit_code"] = merge.returncode if merge else None
+    return out
 
 
 @sm_router.post("/proxy/update-restart", dependencies=[Depends(require_operator_identity)])

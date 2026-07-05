@@ -239,6 +239,29 @@ class TestRulingsRender(unittest.TestCase):
         self.assertEqual({k["id"] for k in refiled}, {"B-AG", "B-GP"})
 
 
+class TestUpdateAndChip(unittest.TestCase):
+    def test_git_is_invoked_with_safe_directory_defeating_dubious_ownership(self):
+        # DEF-016: runtime git under LocalSystem must pass safe.directory or it fails on
+        # 'dubious ownership' — the chip then reads a stale stamp (the bug).
+        self.assertIn("safe.directory=*", sm_proxy._SAFE)
+
+    def test_git_update_is_loud_never_a_silent_noop(self):
+        # a diverged tree returns ok=false WITH the exit code + ahead/behind + a reason;
+        # never a bare success. (Runs against the real repo state — diverged or clean, the
+        # contract holds: ok is a bool and a failure always carries a detail.)
+        u = sm_proxy._git_update()
+        self.assertIn("ok", u)
+        self.assertIsInstance(u["ok"], bool)
+        if not u["ok"]:
+            self.assertTrue(u.get("detail"), "a failed update MUST report why (no silent no-op)")
+
+    def test_read_commit_prefers_real_tree_head_over_a_stale_stamp(self):
+        # the chip's truth is git HEAD (safe under LocalSystem now), stamp is only a fallback
+        head = sm_proxy._git_short("HEAD")
+        if head:
+            self.assertEqual(sm_proxy._read_commit(), head)
+
+
 class TestInstanceIsolation(unittest.TestCase):
     def test_sm_pool_is_7688_only_no_7687_reference(self):
         import inspect
@@ -301,21 +324,26 @@ class TestCommitStampNotRuntimeGit(unittest.TestCase):
     """The running commit is read from the deploy-time STAMP file, not a runtime git
     call — the LocalSystem service can't run git (dubious ownership), which is why the
     chip read 'unknown'. The stamp is the primary source."""
-    def test_commit_state_reads_the_stamp_not_git(self):
+    def test_git_head_is_truth_stamp_is_the_git_less_fallback(self):
+        # DEF-016 fix: the OLD model preferred the stamp over git — a stale stamp (hook
+        # never fired) then made a current process read 'behind'. Corrected: the real tree
+        # HEAD (git, safe under LocalSystem) is the truth; the stamp only fills in when git
+        # is genuinely unavailable.
         import json, tempfile, os
         d = tempfile.mkdtemp()
         vf = os.path.join(d, "proxy_version.json")
         with open(vf, "w", encoding="utf-8") as f:
-            json.dump({"commit": "deadbee", "branch": "main"}, f)
-        orig = sm_proxy._VERSION_FILE
+            json.dump({"commit": "deadbee", "branch": "main"}, f)     # a STALE stamp
+        orig_vf, orig_git = sm_proxy._VERSION_FILE, sm_proxy._git_short
         sm_proxy._VERSION_FILE = vf
         try:
-            self.assertEqual(sm_proxy._stamped_commit(), "deadbee")     # reads the file
-            self.assertEqual(sm_proxy._read_commit(), "deadbee")        # stamp preferred over git
-            st = sm_proxy._commit_state()
-            self.assertEqual(st["commit_source"], "stamp")             # NOT 'git', NOT 'unknown'
+            sm_proxy._git_short = lambda ref="HEAD": "cafe123"        # git available → truth
+            self.assertEqual(sm_proxy._read_commit(), "cafe123")     # git HEAD wins over stale stamp
+            sm_proxy._git_short = lambda ref="HEAD": None             # git-less env → fallback
+            self.assertEqual(sm_proxy._read_commit(), "deadbee")     # stamp fills in
+            self.assertEqual(sm_proxy._stamped_commit(), "deadbee")
         finally:
-            sm_proxy._VERSION_FILE = orig
+            sm_proxy._VERSION_FILE, sm_proxy._git_short = orig_vf, orig_git
 
     def test_missing_stamp_reports_a_source_never_silent(self):
         import os
