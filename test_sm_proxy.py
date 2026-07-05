@@ -120,6 +120,22 @@ class TestAllowlistRunsBeforeTheDriver(unittest.TestCase):
         self.assertEqual(after[-1]["drift"], "read-path-write-attempt")
 
 
+class _FakeRecord(dict):
+    """A record whose node is returned for ANY key access (['n'], ['r'], …)."""
+    def __init__(self, node):
+        super().__init__(node)
+        self._node = node
+
+    def __getitem__(self, k):
+        return self._node
+
+
+class _FakeResult(list):
+    """A neo4j-Result-shaped list: iterable + .single()."""
+    def single(self):
+        return self[0] if self else None
+
+
 class _FakeSession:
     """Canned read-only 7688 session: returns rows keyed by the label in the query."""
     _ROWS = {
@@ -127,17 +143,18 @@ class _FakeSession:
         "SMWatch": [{"id": "B-AG", "detail": "recheck_due ~Dec 2026"}],
         "SMLesson": [{"text": "clustered inference: pooled name-day t inflates by ~sqrt(names)"}],
         "SMBoardItem": [{"id": "V-015"}],
-        "SMRunRequest": [{"id": "run-1"}],
+        "SMRunRequest": [{"id": "run-1", "item_id": "V-015-TDF", "result": {"t": 1.09, "n": 160}}],
+        "SMBuildNote": [{"id": "bn:data-completeness-floor", "dispatch": "data-completeness-floor",
+                         "at": "2026-07-05T00:00:00Z", "built": "assert_pull_complete"}],
     }
 
-    def run(self, cypher):
+    def run(self, cypher, **params):
         for label, rows in self._ROWS.items():
-            if f":{label})" in cypher:
-                # honor the retained filter (SMKill status='retained' → none here)
+            if f":{label})" in cypher or f":{label} " in cypher:
                 if "retained" in cypher:
-                    return []
-                return [{"n": dict(r)} for r in rows]
-        return []
+                    return _FakeResult()
+                return _FakeResult(_FakeRecord(dict(r)) for r in rows)
+        return _FakeResult()
 
     def __enter__(self):
         return self
@@ -170,6 +187,45 @@ class TestHandoffPack(unittest.TestCase):
         # the search-master pool holds no trading-instance reference — DEF-015)
         self.assertIn("research graph (7688) NEVER reaches the trading instance", md)
         self.assertGreater(out["words"], 500)
+
+
+class TestDebrief(unittest.TestCase):
+    def test_debrief_composes_four_voices_readonly(self):
+        import sm_analyst
+        old_d, old_raw = sm_proxy._sm_driver, sm_analyst.raw
+        sm_proxy._sm_driver = _FakeDriver()
+        # fake the proxy LLM: reporter/strategist plain, skeptic+prospector end with markers
+        def fake_raw(system, user, max_tokens=700):
+            if "SKEPTIC" in system:
+                return {"text": "Suspicious.\n\n**SPARKS:**\n- Did we run a placebo?\n- Is n enough?"}
+            if "PROSPECTOR" in system:
+                return {"text": "Ore here.\n\n**GLINTS:**\n- Brick in the tail (t=1.09) — check: split it."}
+            return {"text": "t=1.09 means weak evidence. NEXT CLICK: extend the window."}
+        sm_analyst.raw = fake_raw
+        try:
+            out = sm_proxy.sm_debrief(sm_proxy.SMDebriefRequest(run_id="V-015-TDF"))
+        finally:
+            sm_proxy._sm_driver, sm_analyst.raw = old_d, old_raw
+        for voice in ("reporter", "strategist", "skeptic", "prospector"):
+            self.assertIn(voice, out)
+        self.assertEqual(out["sparks"], ["Did we run a placebo?", "Is n enough?"])
+        self.assertTrue(out["glints"] and "Brick in the tail" in out["glints"][0])
+        self.assertIn("## DEBRIEF", out["markdown"])
+        self.assertEqual(out["cost"]["passes"], 4)
+
+    def test_debrief_unknown_run_is_honest(self):
+        old = sm_proxy._sm_driver
+        class _Empty(_FakeSession):
+            def run(self, cypher, **p):
+                return _FakeResult()                     # no run found
+        class _D:
+            def session(self, **k): return _Empty()
+        sm_proxy._sm_driver = _D()
+        try:
+            out = sm_proxy.sm_debrief(sm_proxy.SMDebriefRequest(run_id="nope"))
+        finally:
+            sm_proxy._sm_driver = old
+        self.assertIn("not found", out["error"])
 
 
 class TestInstanceIsolation(unittest.TestCase):

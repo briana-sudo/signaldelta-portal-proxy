@@ -166,6 +166,11 @@ class SMCancelRequest(BaseModel):
     item_id: str
 
 
+class SMDebriefRequest(BaseModel):
+    run_id: str                                       # 'Debrief this' on a concluded run
+    run: dict[str, Any] | None = None                 # optional inline run (else fetched from 7688)
+
+
 # --- the router --------------------------------------------------------------
 sm_router = APIRouter(prefix="/sm", tags=["search-master"])
 
@@ -427,6 +432,50 @@ def sm_handoff():
             "commits": commits, "words": len(md.split())}
 
 
+@sm_router.post("/debrief", dependencies=[Depends(require_operator_identity)])
+def sm_debrief(req: SMDebriefRequest):
+    """OPERATOR DEBRIEF — four plain-English voices over a concluded run's grounding.
+    READ-ONLY composer: it explains + provokes, writes nothing. The four LLM passes use
+    the proxy's own Anthropic key (sm_analyst.raw); an unreachable key yields honest
+    per-voice absence, never a heuristic imitation."""
+    import sm_analyst
+    if r"C:\SignalDelta_Local" not in _sys.path:
+        _sys.path.insert(0, r"C:\SignalDelta_Local")
+    from searchmaster.engine import debrief as _debrief, build_notes as _bn
+    from searchmaster.engine.llm import LLMUnavailable
+
+    # locate the run: inline, else fetch it (+ grounding slices) from live 7688
+    run = req.run
+    lessons = board = watches = notes = None
+    driver = get_sm_driver()
+    with driver.session(database=SM_NEO4J_DATABASE, default_access_mode="READ") as s:
+        if run is None:
+            rec = s.run("MATCH (r:SMRunRequest) WHERE r.item_id = $id OR r.id = $id RETURN r",
+                        id=req.run_id).single()
+            run = dict(rec["r"]) if rec else None
+        def rws(label, key):
+            return [dict(r[key]) for r in s.run(f"MATCH (n:{label}) WHERE {_BRANCH_ISOLATION} RETURN n AS {key}")]
+        lessons = rws("SMLesson", "n")
+        board = rws("SMBoardItem", "n")
+        watches = rws("SMWatch", "n")
+        notes = _bn.recent_notes(s, 8)
+    if run is None:
+        return {"error": f"run {req.run_id!r} not found in 7688", "unavailable": [{"voice": "*", "reason": "no such run"}]}
+
+    def _proxy_llm(system: str, user: str, *, max_tokens: int = 700) -> str:
+        out = sm_analyst.raw(system, user, max_tokens=max_tokens)
+        if not out.get("text"):
+            raise LLMUnavailable(out.get("reason") or "no-key")
+        return out["text"]
+
+    grounding = _debrief.assemble_grounding(run, lessons=lessons, board=board,
+                                            watches=watches, proposals=notes)
+    db = _debrief.compose_debrief(grounding, llm_call=_proxy_llm)
+    db["run_id"] = req.run_id
+    db["markdown"] = _debrief.render_markdown(db)
+    return db
+
+
 @sm_router.post("/resolve", dependencies=[Depends(require_operator_identity)])
 def sm_resolve(req: SMResolveRequest):
     """Approve/Hold on a board item. Approve on a runnable candidate ENQUEUES ALL of
@@ -594,6 +643,15 @@ def _analyst_state() -> dict[str, Any]:
         state["lessons"] = sm_lessons.lessons()
     except Exception:
         state["lessons"] = []
+    try:                                              # recent build-notes (engine memory)
+        if r"C:\SignalDelta_Local" not in _sys.path:
+            _sys.path.insert(0, r"C:\SignalDelta_Local")
+        from searchmaster.engine import build_notes
+        driver = get_sm_driver()
+        with driver.session(database=SM_NEO4J_DATABASE, default_access_mode="READ") as s:
+            state["build_notes"] = build_notes.recent_notes(s, 8)
+    except Exception:
+        state["build_notes"] = []
     return state
 
 

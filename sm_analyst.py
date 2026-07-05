@@ -96,6 +96,10 @@ def assemble_pack(state: dict[str, Any]) -> str:
         "recent run results (edge/t/n/gate/date-range/universe/error_message): " + json.dumps(runs, default=str),
         "data-needs cards (name/blocker/vendor/cost/tiers/terms/priced?/open-questions/answer/onboard): " + json.dumps(data_needs, default=str),
         "queue: " + json.dumps(state.get("queue") or [], default=str),
+        "\n## RECENT BUILD-NOTES (what the engine built/fixed, newest first — so 'why does "
+        "the number differ from yesterday' is answerable; cite the dispatch + commit)",
+        json.dumps(state.get("build_notes") or [], default=str) if state.get("build_notes")
+        else "(no build-notes filed yet)",
         "\n## BANKED LESSONS (operator-approved; load into every ask)",
         json.dumps(banked, default=str) if banked else "(none banked yet)",
         "\n## PROPOSALS (NOT banked — under operator review; do NOT treat as established truth)",
