@@ -254,13 +254,32 @@ def _read_commit() -> str | None:
 _RUNNING_COMMIT = _read_commit()                # frozen at process start (stamp preferred)
 
 
+_ENGINE_STATE_DIR = r"C:\SignalDelta_Local\searchmaster\state"
+
+
+def _engine_commit_state() -> dict[str, Any]:
+    """The DISCOVERY ENGINE's commit — running (from its heartbeat, stamped at process
+    start) vs deployed (its version stamp). Answers 'is the engine current' with a chip,
+    never pid-vs-commit-time archaeology. Files only; no runtime git."""
+    def _c(fname):
+        try:
+            with open(os.path.join(_ENGINE_STATE_DIR, fname), encoding="utf-8") as f:
+                return (json.load(f) or {}).get("commit")
+        except Exception:
+            return None
+    run_c, tree_c = _c("engine_service.json"), _c("engine_version.json")
+    return {"engine_commit": run_c, "engine_tree_commit": tree_c,
+            "engine_stale": bool(run_c and tree_c and run_c != tree_c)}
+
+
 def _commit_state() -> dict[str, Any]:
     # tree = the stamp RE-READ now (the deploy hook rewrites it on each commit), so a
     # commit-without-restart shows stale — all without a runtime git call.
     tree = _read_commit()
     return {"running_commit": _RUNNING_COMMIT, "tree_commit": tree,
             "stale": bool(_RUNNING_COMMIT and tree and _RUNNING_COMMIT != tree),
-            "commit_source": "stamp" if _stamped_commit() else ("git" if _RUNNING_COMMIT else "unknown")}
+            "commit_source": "stamp" if _stamped_commit() else ("git" if _RUNNING_COMMIT else "unknown"),
+            **_engine_commit_state()}
 
 
 def _surface_of(parent_or_id: str) -> str:
