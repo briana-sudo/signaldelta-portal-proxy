@@ -162,6 +162,10 @@ class SMReevaluateRequest(BaseModel):
     item_id: str
 
 
+class SMCancelRequest(BaseModel):
+    item_id: str
+
+
 # --- the router --------------------------------------------------------------
 sm_router = APIRouter(prefix="/sm", tags=["search-master"])
 
@@ -417,6 +421,19 @@ def sm_reevaluate(req: SMReevaluateRequest):
     try:
         run_queue, _ = _sm_engine()
         return run_queue.enqueue_reterminus(req.item_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"engine unavailable: {e}")
+
+
+@sm_router.post("/probe/cancel", dependencies=[Depends(require_operator_identity)])
+def sm_probe_cancel(req: SMCancelRequest):
+    """Operator-initiated abort of a running (or queued) probe. Sets the cancel flag in
+    7688; the engine's supervisor polls it and aborts the worker cooperatively → the run
+    is ERRORED 'cancelled by operator', the lock released, the item re-approvable. This
+    endpoint only sets intent — it never grades, decides, or touches the trading engine."""
+    try:
+        run_queue, _ = _sm_engine()
+        return run_queue.request_cancel(req.item_id)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"engine unavailable: {e}")
 

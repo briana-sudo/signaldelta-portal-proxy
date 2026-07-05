@@ -149,6 +149,7 @@ class TestEnginePowerSwitch(unittest.TestCase):
         self.assertIn("/sm/engine/status", paths)
         self.assertIn("/sm/engine/start", paths)
         self.assertIn("/sm/engine/stop", paths)
+        self.assertIn("/sm/probe/cancel", paths)         # operator abort of a running probe
 
     def test_engine_module_is_a_power_switch_no_research_or_trading_path(self):
         import inspect, sm_engine
