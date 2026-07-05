@@ -69,13 +69,28 @@ def propose(text: str, source: str = "", proposed_by: str = "analyst",
 
 
 def bank(lesson_id: str) -> dict[str, Any]:
-    """OPERATOR promotes a proposed lesson to BANKED. Only path that sets BANKED."""
+    """OPERATOR promotes a proposed lesson to BANKED. Only path that sets BANKED.
+    Banking CLEARS any stale superseded_by/superseded_at — a BANKED lesson is the
+    ACTIVE one and must never point at a superseder (self-heals the re-terminus bug
+    where a later PROPOSED draft stamped superseded_by onto an already-banked lesson)."""
     d = _driver()
     with d.session(database=_DB) as s:
         rec = s.run(f"MATCH (n:SMLesson {{id:$i}}) WHERE {_ISO} "
-                    "SET n.status='BANKED', n.banked_at=$now RETURN n.status AS st",
+                    "SET n.status='BANKED', n.banked_at=$now, "
+                    "n.superseded_by=null, n.superseded_at=null RETURN n.status AS st",
                     i=lesson_id, now=_now()).single()
     return {"id": lesson_id, "status": rec["st"] if rec else "not-found"}
+
+
+def validate_banked() -> list[dict[str, Any]]:
+    """Integrity guard: a BANKED lesson must NOT carry a superseded_by — it IS the
+    active lesson. Returns any violators (empty list = clean). A re-terminus that only
+    supersedes PROPOSED can't create a violator; this catches stale data + regressions."""
+    d = _driver()
+    with d.session(database=_DB, default_access_mode="READ") as s:
+        return [dict(r["n"]) for r in s.run(
+            f"MATCH (n:SMLesson) WHERE {_ISO} AND n.status='BANKED' "
+            "AND n.superseded_by IS NOT NULL RETURN n")]
 
 
 def unbank(lesson_id: str) -> dict[str, Any]:

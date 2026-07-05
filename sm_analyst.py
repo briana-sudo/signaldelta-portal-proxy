@@ -68,7 +68,10 @@ def assemble_pack(state: dict[str, Any]) -> str:
         # so the analyst never calls an error a gate FAIL or a classified kill.
         row["error_message"] = r.get("error_message") or r.get("error")
         runs.append(row)
-    banked = [l for l in (state.get("lessons") or []) if l.get("status") == "BANKED"]
+    # BANKED = operator-approved AND active (a BANKED lesson must not point at a
+    # superseder; validate_banked() keeps this true, so the filter is belt-and-suspenders).
+    banked = [l for l in (state.get("lessons") or [])
+              if l.get("status") == "BANKED" and not l.get("superseded_by")]
     # data-needs cards WITH their persisted pricing + open worker questions + answers
     data_needs = [{k: g.get(k) for k in (
         "id", "surface_id", "surface", "title", "blocker", "kind", "vendor", "cost_yr",
@@ -76,7 +79,14 @@ def assemble_pack(state: dict[str, Any]) -> str:
         "priced_questions", "answer", "note", "configured")}
         for g in (state.get("data_needs") or [])]
     parts = [
-        "## LIVE ENGINE STATE (7688)",
+        "## LAWS (hard predicates the engine obeys — cite them when relevant)",
+        "- WINDOW-SPEND LAW: a sealed out-of-sample (OOS) window is the scarcest resource in the "
+        "program. It is spent ONLY by an explicit operator Approve token — NEVER auto-OOS, never by "
+        "the engine on its own, never to 'just check'. A combination/validation test that would "
+        "consume a sealed window requires the operator's approval; the capability to spend a window "
+        "without that token does not exist. If asked to run one, say it needs the operator's Approve "
+        "and stop.",
+        "\n## LIVE ENGINE STATE (7688)",
         "board (with per-component states): " + json.dumps(board, default=str),
         "watches (revival): " + json.dumps(state.get("watches") or [], default=str),
         "scan_history (recent): " + json.dumps((state.get("scan_history") or [])[:3], default=str),
