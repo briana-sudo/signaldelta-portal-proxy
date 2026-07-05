@@ -432,6 +432,20 @@ def sm_handoff():
             "commits": commits, "words": len(md.split())}
 
 
+@sm_router.get("/ruling-sheet", dependencies=[Depends(require_operator_identity)])
+def sm_ruling_sheet():
+    """OPERATOR RULING SHEET — the kill-board audit's findings as one decision MD (items
+    a–h, four columns each, every item a PROPOSAL). Read-only: serves the committed audit
+    artifact; it executes nothing and creates no run/bank/write."""
+    path = r"C:\SignalDelta_Local\searchmaster\docs\OPERATOR_RULING_SHEET.md"
+    try:
+        with open(path, encoding="utf-8") as f:
+            md = f.read()
+        return {"markdown": md, "words": len(md.split()), "source": "audit-completion-pass"}
+    except FileNotFoundError:
+        return {"markdown": None, "error": "ruling sheet not generated yet (run the audit with --sheet)"}
+
+
 @sm_router.post("/debrief", dependencies=[Depends(require_operator_identity)])
 def sm_debrief(req: SMDebriefRequest):
     """OPERATOR DEBRIEF — four plain-English voices over a concluded run's grounding.
