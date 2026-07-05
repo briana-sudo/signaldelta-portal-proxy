@@ -59,12 +59,19 @@ def assemble_pack(state: dict[str, Any]) -> str:
     runs = [{k: r.get(k) for k in ("recipe_id", "disposition", "t", "n", "edge_pct_per_day", "gate_pass", "window", "universe")}
             for r in (state.get("runs") or [])]
     banked = [l for l in (state.get("lessons") or []) if l.get("status") == "BANKED"]
+    # data-needs cards WITH their persisted pricing + open worker questions + answers
+    data_needs = [{k: g.get(k) for k in (
+        "id", "surface_id", "surface", "title", "blocker", "kind", "vendor", "cost_yr",
+        "monthly", "tiers", "terms", "what_you_get", "ev", "unlocks", "priced",
+        "priced_questions", "answer", "note", "configured")}
+        for g in (state.get("data_needs") or [])]
     parts = [
         "## LIVE ENGINE STATE (7688)",
         "board (with per-component states): " + json.dumps(board, default=str),
         "watches (revival): " + json.dumps(state.get("watches") or [], default=str),
         "scan_history (recent): " + json.dumps((state.get("scan_history") or [])[:3], default=str),
         "recent run results (edge/t/n/gate/date-range/universe): " + json.dumps(runs, default=str),
+        "data-needs cards (name/blocker/vendor/cost/tiers/terms/priced?/open-questions/answer/onboard): " + json.dumps(data_needs, default=str),
         "queue: " + json.dumps(state.get("queue") or [], default=str),
         "\n## BANKED LESSONS (operator-approved; load into every ask)",
         json.dumps(banked, default=str) if banked else "(none banked yet)",

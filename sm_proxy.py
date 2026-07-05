@@ -417,14 +417,41 @@ def sm_onboard(req: SMOnboardRequest):
 
 
 # --- COSTING WORKER (Part B) — "Price it / Research" fills the Data-needs fields ---
+def _persist_costing(card_id: str, result: dict[str, Any]) -> bool:
+    """PERSIST the pricing result onto the SMGatedSurface node (matched by id OR
+    surface_id — the two id fields the seed and the terminus each wrote), so priced
+    fields survive refresh/restart instead of living only in client session state.
+    Best-effort: a 7688 hiccup leaves the (still-returned) result client-side."""
+    if not card_id:
+        return False
+    import datetime as _dt
+    fields = result.get("fields") or {}
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    try:
+        driver = get_sm_driver()
+        with driver.session(database=SM_NEO4J_DATABASE) as s:
+            rec = s.run(f"MATCH (n:SMGatedSurface) WHERE {_BRANCH_ISOLATION} "
+                        "AND (n.id=$i OR n.surface_id=$i) "
+                        "SET n += $f, n.priced=true, n.priced_questions=$q, n.priced_at=$now "
+                        "RETURN count(n) AS c",
+                        i=card_id, f=fields, q=json.dumps(result.get("questions") or []),
+                        now=now).single()
+            return bool(rec and rec["c"])
+    except Exception:
+        return False
+
+
 @sm_router.post("/research", dependencies=[Depends(require_operator_identity)])
 def sm_research(req: SMResearchRequest):
     """Research the real cost of a gated surface (vendor, cost/yr, monthly, terms,
     tiers, what-you-get) and return filled fields + the operator's judgment-call
-    questions. FIREWALL: researches + fills only — NEVER buys, onboards, or spends;
-    Approve stays the operator's. (No onboard/resolve/secrets call in this path.)"""
+    questions. PERSISTS the result to 7688 so it survives refresh. FIREWALL:
+    researches + fills only — NEVER buys, onboards, or spends; Approve stays the
+    operator's. (No onboard/resolve/secrets call in this path.)"""
     import sm_costing
-    return sm_costing.research(req.surface_id, req.surface)
+    result = sm_costing.research(req.surface_id, req.surface)
+    result["persisted"] = _persist_costing(req.surface_id, result)
+    return result
 
 
 # --- ANALYST (real LLM, grounded) + GATED LEARNING (SMLesson) -----------------
@@ -435,7 +462,10 @@ def _analyst_state() -> dict[str, Any]:
     try:
         rm = sm_readmodel()
         state.update({"board": rm.get("board"), "watches": rm.get("watches"),
-                      "scan_history": rm.get("scan_history")})
+                      "scan_history": rm.get("scan_history"),
+                      # data-needs cards WITH their PERSISTED pricing (so the analyst
+                      # speaks from saved truth, not client session state)
+                      "data_needs": rm.get("gated")})
     except Exception:
         pass
     try:
