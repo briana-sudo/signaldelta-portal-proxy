@@ -343,6 +343,8 @@ def sm_readmodel():
             # every run (probe / component / re-terminus) with its stage progress,
             # result, disposition record + report version history — the Run Room source
             "runs": runs,
+            # SURVIVOR pipelines (S1–S6) opened on retained candidates
+            "candidates": rows("SMCandidate", order=" ORDER BY n.opened_at DESC"),
             # TERMINUS combiner outputs: per-run return streams + pairwise rho graph
             "streams": rows("SMReturnStream"),
             "correlations": [
