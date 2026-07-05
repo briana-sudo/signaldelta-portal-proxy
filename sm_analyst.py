@@ -30,6 +30,7 @@ HARD ROLE RULES:
 - Ground every claim in the STATE or CORPUS provided below. Cite which board item / watch / scan / run result / corpus predicate / banked lesson you used.
 - If something is not in your state or corpus, say plainly "I don't know — that's not in my state" and stop. NEVER invent numbers, edges, or facts. Prefer the engine's own numbers (edge, t, n, gate, date range, universe).
 - If a run ERRORED (it carries an error_message and no gate/classification), report it as an ERROR — quote the message verbatim — never as a gate FAIL, a kill, or a classified result.
+- ANSWER-FIRST: NEVER ask the operator for data that is already in your STATE. Lead with your best substantive answer FROM STATE — default to the most recent relevant run and its proposals (proposed lessons, derivations, watches). Ask AT MOST ONE narrow question, and only for genuinely absent information. "The run failed, should I bank?" is answered by citing the latest run's error/result + the current proposals and explaining that banking is the operator's call on a PROPOSED lesson — not by asking what run they mean.
 
 ARCHITECTURE (hard facts):
 - You are the DISCOVERY analyst. Your entire world is the SEARCH-MASTER graph (Neo4j 7688) — the board, watches, scans, run results, kills, gated surfaces, and lessons provided below. That is the only system you can see or speak about.
@@ -72,6 +73,8 @@ def assemble_pack(state: dict[str, Any]) -> str:
     # superseder; validate_banked() keeps this true, so the filter is belt-and-suspenders).
     banked = [l for l in (state.get("lessons") or [])
               if l.get("status") == "BANKED" and not l.get("superseded_by")]
+    proposed = [{k: l.get(k) for k in ("id", "component", "text", "classified_by", "provisional")}
+                for l in (state.get("lessons") or []) if l.get("status") == "PROPOSED"]
     # data-needs cards WITH their persisted pricing + open worker questions + answers
     data_needs = [{k: g.get(k) for k in (
         "id", "surface_id", "surface", "title", "blocker", "kind", "vendor", "cost_yr",
@@ -95,6 +98,8 @@ def assemble_pack(state: dict[str, Any]) -> str:
         "queue: " + json.dumps(state.get("queue") or [], default=str),
         "\n## BANKED LESSONS (operator-approved; load into every ask)",
         json.dumps(banked, default=str) if banked else "(none banked yet)",
+        "\n## PROPOSALS (NOT banked — under operator review; do NOT treat as established truth)",
+        json.dumps(proposed, default=str) if proposed else "(no proposals pending)",
         "\n## SEED STATE (retained / killed / queue / kill-regions)",
         _read(_SEED),
         "\n## ABANDONMENT CORPUS (candidate-vetting predicates A1–A38)",

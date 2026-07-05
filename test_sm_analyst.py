@@ -47,6 +47,22 @@ class AnalystFirewallTest(unittest.TestCase):
         self.assertIn("out of scope", low)
         self.assertIn("never", low)
 
+    def test_answer_first_rule_in_prompt(self):
+        low = sm_analyst._SYSTEM.lower()
+        self.assertIn("answer-first", low)
+        self.assertIn("never ask", low)                     # never ask for data already in state
+        self.assertIn("most recent relevant run", low)
+
+    def test_proposed_lessons_enter_the_pack_flagged(self):
+        state = {"lessons": [
+            {"id": "L-prop", "component": "V-015-TDF", "status": "PROPOSED", "text": "clustered day-level t=1.1 inconclusive"},
+            {"id": "L-bank", "component": "V-015-TOM", "status": "BANKED", "text": "true null"}]}
+        pack = sm_analyst.assemble_pack(state)
+        self.assertIn("PROPOSALS", pack)
+        self.assertIn("under operator review", pack)
+        self.assertIn("clustered day-level t=1.1 inconclusive", pack)   # the proposed text is answerable
+        self.assertIn("do NOT treat as established", pack)
+
     def test_fallback_is_honest_not_empty(self):
         orig = sm_analyst._anthropic_key
         sm_analyst._anthropic_key = lambda: None            # simulate no key
