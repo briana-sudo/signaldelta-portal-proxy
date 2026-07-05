@@ -81,7 +81,10 @@ def _call_anthropic(system: str, history: list[dict], question: str, key: str) -
              "content": str(m.get("text", ""))[:4000]}
             for m in (history or []) if m.get("text")][-8:]
     msgs.append({"role": "user", "content": question})
-    body = {"model": _MODEL, "max_tokens": 1024, "system": system, "messages": msgs}
+    # 1024 truncated multi-part answers mid-list (part 3 of 5, 4-5 absent). Give long
+    # answers room to finish; override with SM_ANALYST_MAX_TOKENS if needed.
+    max_tokens = int(os.environ.get("SM_ANALYST_MAX_TOKENS", "4096"))
+    body = {"model": _MODEL, "max_tokens": max_tokens, "system": system, "messages": msgs}
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages", data=json.dumps(body).encode(),
         headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
