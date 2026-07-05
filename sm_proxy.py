@@ -207,13 +207,23 @@ import subprocess as _subp
 _PROXY_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+# the LocalSystem service PATH often lacks git → try the standard install paths too,
+# else running_commit reads null even though the code IS current (the commit chip lie).
+_GIT_BINS = ("git", r"C:\Program Files\Git\cmd\git.exe", r"C:\Program Files\Git\bin\git.exe",
+             r"C:\Program Files (x86)\Git\cmd\git.exe")
+
+
 def _git_short(ref: str = "HEAD") -> str | None:
-    try:
-        r = _subp.run(["git", "-C", _PROXY_DIR, "rev-parse", "--short", ref],
-                      capture_output=True, text=True, timeout=5)
-        return (r.stdout or "").strip() or None
-    except Exception:
-        return None
+    for gitexe in _GIT_BINS:
+        try:
+            r = _subp.run([gitexe, "-C", _PROXY_DIR, "rev-parse", "--short", ref],
+                          capture_output=True, text=True, timeout=5)
+            out = (r.stdout or "").strip()
+            if r.returncode == 0 and out:
+                return out
+        except Exception:
+            continue
+    return None
 
 
 _RUNNING_COMMIT = _git_short("HEAD")            # frozen at process start
