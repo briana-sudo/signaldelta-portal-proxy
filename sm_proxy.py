@@ -358,7 +358,12 @@ def sm_readmodel():
             "state": state[0] if state else {},
             "grid": grid,
             "ledger": rows("SMComponent"),
-            "kills": rows("SMKill"),
+            # ruling a/b: a refiled kill (WATCH / OCCUPIED) leaves the kill-subtraction list
+            # and surfaces as raw material; the remaining kills carry revival_class + scope.
+            "kills": [k for k in rows("SMKill")
+                      if (k.get("status") or "killed") not in ("watch", "occupied")],
+            "refiled": [k for k in rows("SMKill")
+                        if (k.get("status") or "") in ("watch", "occupied")],
             "gated": rows("SMGatedSurface"),
             "deployed": rows("SMDeployedSignal"),
             # revival monitor state + recheck-scan history (the Timeline's live source)

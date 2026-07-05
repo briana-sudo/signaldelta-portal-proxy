@@ -228,6 +228,17 @@ class TestDebrief(unittest.TestCase):
         self.assertIn("not found", out["error"])
 
 
+class TestRulingsRender(unittest.TestCase):
+    def test_refiled_kills_leave_the_kill_list_and_surface_separately(self):
+        # a WATCH/OCCUPIED refile is no longer a kill-subtraction; it lands in `refiled`
+        rm_kills = [{"id": "B-VAL", "status": "killed"}, {"id": "B-AG", "status": "watch"},
+                    {"id": "B-GP", "status": "occupied"}]
+        kills = [k for k in rm_kills if (k.get("status") or "killed") not in ("watch", "occupied")]
+        refiled = [k for k in rm_kills if (k.get("status") or "") in ("watch", "occupied")]
+        self.assertEqual([k["id"] for k in kills], ["B-VAL"])
+        self.assertEqual({k["id"] for k in refiled}, {"B-AG", "B-GP"})
+
+
 class TestInstanceIsolation(unittest.TestCase):
     def test_sm_pool_is_7688_only_no_7687_reference(self):
         import inspect

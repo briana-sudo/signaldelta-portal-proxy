@@ -93,6 +93,25 @@ def validate_banked() -> list[dict[str, Any]]:
             "AND n.superseded_by IS NOT NULL RETURN n")]
 
 
+def validate_lineage() -> list[dict[str, Any]]:
+    """Ruling h — integrity guard so the dangling state can't recur: a SUPERSEDED lesson
+    MUST carry a superseded_by that resolves to a known lesson. Returns violators (empty =
+    clean). The 4 historical dangling lessons were retracted by the ruling executor; this
+    catches any regression before it reaches the analyst's lineage."""
+    d = _driver()
+    with d.session(database=_DB, default_access_mode="READ") as s:
+        known = {dict(r["n"])["id"] for r in s.run(
+            f"MATCH (n:SMLesson) WHERE {_ISO} RETURN n")}
+        out = []
+        for r in s.run(f"MATCH (n:SMLesson) WHERE {_ISO} AND n.status='SUPERSEDED' RETURN n"):
+            n = dict(r["n"])
+            sby = n.get("superseded_by")
+            if not sby or sby not in known:
+                out.append({"id": n["id"], "superseded_by": sby,
+                            "violation": "empty" if not sby else "unresolvable"})
+        return out
+
+
 def unbank(lesson_id: str) -> dict[str, Any]:
     """OPERATOR retracts a banked lesson → RETRACTED: removed from the grounding pack
     (assemble_pack loads only BANKED), history kept. Only a BANKED lesson can unbank."""
