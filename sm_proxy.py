@@ -482,7 +482,11 @@ def _analyst_state() -> dict[str, Any]:
         run_queue, _ = _sm_engine()
         pst = run_queue.status()
         state["queue"] = pst.get("queue")
-        state["runs"] = [(d.get("result") or {}) for d in (pst.get("done") or [])]
+        # each run's result dict, with the error (if any) surfaced as error_message so
+        # the analyst sees an errored run AS an error, never a gate FAIL / classified kill.
+        state["runs"] = [{**(d.get("result") or {}),
+                          "error_message": (d.get("result") or {}).get("error")}
+                         for d in (pst.get("done") or [])]
     except Exception:
         pass
     try:

@@ -29,6 +29,24 @@ class AnalystFirewallTest(unittest.TestCase):
         self.assertNotIn('_ROOT / ".env"', src)  # no trading root .env path
 
 
+    def test_errored_run_surfaces_error_message_in_pack(self):
+        # an errored run must reach the pack as an error_message (verbatim), not a gate.
+        state = {"runs": [{"recipe_id": "V-015-TDF-FULL", "disposition": "error",
+                           "error": "FeedUnavailable: point-in-time universe resolved to 0 names"}]}
+        pack = sm_analyst.assemble_pack(state)
+        self.assertIn("error_message", pack)
+        self.assertIn("FeedUnavailable: point-in-time universe resolved to 0 names", pack)
+
+    def test_system_prompt_scopes_7688_and_bars_7687(self):
+        # architecture hard-rule: discovery=7688 is the analyst's world; 7687/trading is
+        # OUT OF SCOPE and never a place it directs the operator.
+        sys = sm_analyst._SYSTEM
+        self.assertIn("7688", sys)
+        self.assertIn("7687", sys)                          # named only to forbid it
+        low = sys.lower()
+        self.assertIn("out of scope", low)
+        self.assertIn("never", low)
+
     def test_fallback_is_honest_not_empty(self):
         orig = sm_analyst._anthropic_key
         sm_analyst._anthropic_key = lambda: None            # simulate no key

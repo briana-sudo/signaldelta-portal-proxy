@@ -29,7 +29,11 @@ HARD ROLE RULES:
 - You NEVER grade a result, NEVER decide, NEVER instruct an action, NEVER trade, NEVER write anything. Those are not yours: DECISIONS route to the operator; a RE-GRADE of a killed result routes to deliberate-review. Say so, in your own words, when asked to decide or re-grade.
 - Ground every claim in the STATE or CORPUS provided below. Cite which board item / watch / scan / run result / corpus predicate / banked lesson you used.
 - If something is not in your state or corpus, say plainly "I don't know — that's not in my state" and stop. NEVER invent numbers, edges, or facts. Prefer the engine's own numbers (edge, t, n, gate, date range, universe).
-- You never touch the trading engine (7687). You are the research analyst only.
+- If a run ERRORED (it carries an error_message and no gate/classification), report it as an ERROR — quote the message verbatim — never as a gate FAIL, a kill, or a classified result.
+
+ARCHITECTURE (hard facts):
+- You are the DISCOVERY analyst. Your entire world is the SEARCH-MASTER graph (Neo4j 7688) — the board, watches, scans, run results, kills, gated surfaces, and lessons provided below. That is the only system you can see or speak about.
+- The TRADING engine (Neo4j 7687, TradeNodes, the live paper/broker account, the trading dashboard) is a SEPARATE system that is OUT OF SCOPE for you. You have no visibility into it and you NEVER direct the operator to it — do not name 7687, the trading engine, or live positions as a place to look, check, or act. If a question is about trading or positions, say plainly that it's outside the discovery console's scope. (Hard rule, no exceptions.)
 Be concise and concrete."""
 
 _FALLBACK = ("I can't answer that with the analyst LLM right now (the server-side key or API is unavailable). "
@@ -56,8 +60,14 @@ def assemble_pack(state: dict[str, Any]) -> str:
     """Build the grounding pack from live state + corpus + banked lessons. No secrets."""
     board = [{k: b.get(k) for k in ("item_id", "title", "kind", "ev", "status", "disposition", "components")}
              for b in (state.get("board") or [])]
-    runs = [{k: r.get(k) for k in ("recipe_id", "disposition", "t", "n", "edge_pct_per_day", "gate_pass", "window", "universe")}
-            for r in (state.get("runs") or [])]
+    runs = []
+    for r in (state.get("runs") or []):
+        row = {k: r.get(k) for k in ("recipe_id", "disposition", "t", "n", "edge_pct_per_day",
+                                     "gate_pass", "window", "universe")}
+        # a run that errored carries a verbatim message and reached NO gate — surface it
+        # so the analyst never calls an error a gate FAIL or a classified kill.
+        row["error_message"] = r.get("error_message") or r.get("error")
+        runs.append(row)
     banked = [l for l in (state.get("lessons") or []) if l.get("status") == "BANKED"]
     # data-needs cards WITH their persisted pricing + open worker questions + answers
     data_needs = [{k: g.get(k) for k in (
@@ -70,7 +80,7 @@ def assemble_pack(state: dict[str, Any]) -> str:
         "board (with per-component states): " + json.dumps(board, default=str),
         "watches (revival): " + json.dumps(state.get("watches") or [], default=str),
         "scan_history (recent): " + json.dumps((state.get("scan_history") or [])[:3], default=str),
-        "recent run results (edge/t/n/gate/date-range/universe): " + json.dumps(runs, default=str),
+        "recent run results (edge/t/n/gate/date-range/universe/error_message): " + json.dumps(runs, default=str),
         "data-needs cards (name/blocker/vendor/cost/tiers/terms/priced?/open-questions/answer/onboard): " + json.dumps(data_needs, default=str),
         "queue: " + json.dumps(state.get("queue") or [], default=str),
         "\n## BANKED LESSONS (operator-approved; load into every ask)",
