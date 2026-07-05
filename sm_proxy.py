@@ -389,6 +389,44 @@ def _sm_engine():
     return run_queue, recipe_registry
 
 
+@sm_router.get("/handoff", dependencies=[Depends(require_operator_identity)])
+def sm_handoff():
+    """LEAD HANDOFF PACK — compose the successor's boot briefing (BOOT_CONTEXT.md) FRESH
+    from live 7688 + config + code. READ-ONLY: a VIEW of state, never stored, never a
+    mutation. Returns {markdown, manifest, generated_at, provenance, commits, words}."""
+    import datetime as _dt
+    if r"C:\SignalDelta_Local" not in _sys.path:
+        _sys.path.insert(0, r"C:\SignalDelta_Local")
+    from searchmaster.engine import handoff as _handoff, audit as _audit
+
+    driver = get_sm_driver()                          # 503 until 7688 provisioned
+    with driver.session(database=SM_NEO4J_DATABASE, default_access_mode="READ") as session:
+        def rows(label: str, where: str = _BRANCH_ISOLATION) -> list[dict[str, Any]]:
+            return [dict(r["n"]) for r in session.run(
+                f"MATCH (n:{label}) WHERE {where} RETURN n")]
+        killed = rows("SMKill")
+        for k in killed:                              # revival-class each (assigned-or-flagged)
+            rc = _audit.revival_class({"reason": k.get("reason", ""),
+                                       "disposition": k.get("disposition"),
+                                       "revival_class": k.get("revival_class")})
+            k["revival_class"] = rc["revival_class"] or "UNASSIGNED-FLAG"
+        state = {
+            "provenance": "live-7688", "killed": killed,
+            "retained": rows("SMKill", where=f"{_BRANCH_ISOLATION} AND n.status = 'retained'"),
+            "watches": rows("SMWatch"), "lessons": rows("SMLesson"),
+            "board": rows("SMBoardItem"), "runs": rows("SMRunRequest"),
+            "defects": _handoff.DEFECTS, "standards": _handoff.STANDARDS,
+        }
+    cs = _commit_state()
+    commits = {"proxy": cs.get("running_commit") or "unstamped",
+               "engine": cs.get("engine_commit") or "unstamped"}
+    generated_at = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    md = _handoff.compose_pack(state, generated_at=generated_at, commits=commits)
+    return {"markdown": md, "manifest": _handoff.COMPANION_MANIFEST,
+            "generated_at": generated_at, "provenance": state["provenance"],
+            "commits": commits, "words": len(md.split())}
+
+
 @sm_router.post("/resolve", dependencies=[Depends(require_operator_identity)])
 def sm_resolve(req: SMResolveRequest):
     """Approve/Hold on a board item. Approve on a runnable candidate ENQUEUES ALL of

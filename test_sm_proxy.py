@@ -120,6 +120,58 @@ class TestAllowlistRunsBeforeTheDriver(unittest.TestCase):
         self.assertEqual(after[-1]["drift"], "read-path-write-attempt")
 
 
+class _FakeSession:
+    """Canned read-only 7688 session: returns rows keyed by the label in the query."""
+    _ROWS = {
+        "SMKill": [{"id": "B-AG", "reason": "recently-decayed", "status": "killed"}],
+        "SMWatch": [{"id": "B-AG", "detail": "recheck_due ~Dec 2026"}],
+        "SMLesson": [{"text": "clustered inference: pooled name-day t inflates by ~sqrt(names)"}],
+        "SMBoardItem": [{"id": "V-015"}],
+        "SMRunRequest": [{"id": "run-1"}],
+    }
+
+    def run(self, cypher):
+        for label, rows in self._ROWS.items():
+            if f":{label})" in cypher:
+                # honor the retained filter (SMKill status='retained' → none here)
+                if "retained" in cypher:
+                    return []
+                return [{"n": dict(r)} for r in rows]
+        return []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeDriver:
+    def session(self, **kw):
+        return _FakeSession()
+
+
+class TestHandoffPack(unittest.TestCase):
+    def test_handoff_composes_live_pack_readonly(self):
+        old = sm_proxy._sm_driver
+        sm_proxy._sm_driver = _FakeDriver()
+        try:
+            out = sm_proxy.sm_handoff()
+        finally:
+            sm_proxy._sm_driver = old
+        md = out["markdown"]
+        self.assertEqual(out["provenance"], "live-7688")
+        for section in ("ROLES & LAWS", "HONEST CURRENT STATE", "RESEARCH STATE",
+                        "ENGINEERING STATE", "HOW TO OPERATE"):
+            self.assertIn(section, md)
+        # a live pack CAN quote a banked lesson (the disk-fallback pack cannot)
+        self.assertIn("clustered inference", md)
+        # the non-negotiable firewall law is present (worded without the port literal so
+        # the search-master pool holds no trading-instance reference — DEF-015)
+        self.assertIn("research graph (7688) NEVER reaches the trading instance", md)
+        self.assertGreater(out["words"], 500)
+
+
 class TestInstanceIsolation(unittest.TestCase):
     def test_sm_pool_is_7688_only_no_7687_reference(self):
         import inspect
