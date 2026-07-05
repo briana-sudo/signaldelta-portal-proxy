@@ -34,6 +34,11 @@ if errorlevel 1 (
   exit /b 1
 )
 
+REM Stamp the running commit into proxy_version.json (runs here as the repo owner,
+REM where git works). The service — which runs as LocalSystem and CANNOT run git —
+REM reads this file to report its commit. No git call at runtime.
+python write_proxy_version.py
+
 echo.
 echo [proxy] Starting FastAPI on http://127.0.0.1:8000
 echo [proxy] In a separate terminal, run start_tunnel.bat to expose this over HTTPS.

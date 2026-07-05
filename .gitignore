@@ -10,3 +10,6 @@ __pycache__/
 .ruff_cache/
 *.log
 .DS_Store
+
+# runtime commit stamp (written at deploy/install by write_proxy_version.py)
+proxy_version.json

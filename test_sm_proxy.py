@@ -177,5 +177,38 @@ class TestServerSideSecrets(unittest.TestCase):
         self.assertNotIn("credential", resp)                # record shows configured, not the key
 
 
+class TestCommitStampNotRuntimeGit(unittest.TestCase):
+    """The running commit is read from the deploy-time STAMP file, not a runtime git
+    call — the LocalSystem service can't run git (dubious ownership), which is why the
+    chip read 'unknown'. The stamp is the primary source."""
+    def test_commit_state_reads_the_stamp_not_git(self):
+        import json, tempfile, os
+        d = tempfile.mkdtemp()
+        vf = os.path.join(d, "proxy_version.json")
+        with open(vf, "w", encoding="utf-8") as f:
+            json.dump({"commit": "deadbee", "branch": "main"}, f)
+        orig = sm_proxy._VERSION_FILE
+        sm_proxy._VERSION_FILE = vf
+        try:
+            self.assertEqual(sm_proxy._stamped_commit(), "deadbee")     # reads the file
+            self.assertEqual(sm_proxy._read_commit(), "deadbee")        # stamp preferred over git
+            st = sm_proxy._commit_state()
+            self.assertEqual(st["commit_source"], "stamp")             # NOT 'git', NOT 'unknown'
+        finally:
+            sm_proxy._VERSION_FILE = orig
+
+    def test_missing_stamp_reports_a_source_never_silent(self):
+        import os
+        orig = sm_proxy._VERSION_FILE
+        sm_proxy._VERSION_FILE = os.path.join(os.path.dirname(orig), "does-not-exist.json")
+        try:
+            # no stamp → _stamped_commit None; commit_source is 'git' (dev) or 'unknown' —
+            # never a silent lie. (The point: the source is always reported.)
+            self.assertIsNone(sm_proxy._stamped_commit())
+            self.assertIn(sm_proxy._commit_state()["commit_source"], ("git", "unknown"))
+        finally:
+            sm_proxy._VERSION_FILE = orig
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

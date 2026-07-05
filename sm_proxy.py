@@ -213,7 +213,13 @@ _GIT_BINS = ("git", r"C:\Program Files\Git\cmd\git.exe", r"C:\Program Files\Git\
              r"C:\Program Files (x86)\Git\cmd\git.exe")
 
 
+_VERSION_FILE = os.path.join(_PROXY_DIR, "proxy_version.json")
+
+
 def _git_short(ref: str = "HEAD") -> str | None:
+    """DEV-ONLY fallback. In the LocalSystem service this fails (git dubious-ownership,
+    LocalSystem != repo owner), which is exactly why the stamp file is the primary
+    source. Kept for a developer running the proxy under their own account."""
     for gitexe in _GIT_BINS:
         try:
             r = _subp.run([gitexe, "-C", _PROXY_DIR, "rev-parse", "--short", ref],
@@ -226,13 +232,31 @@ def _git_short(ref: str = "HEAD") -> str | None:
     return None
 
 
-_RUNNING_COMMIT = _git_short("HEAD")            # frozen at process start
+def _stamped_commit() -> str | None:
+    """The commit stamped into proxy_version.json at deploy/install time (by the repo
+    OWNER, where git works — a post-commit/post-merge hook or Setup). This is the
+    PRIMARY source; NO runtime git under LocalSystem."""
+    try:
+        with open(_VERSION_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("commit") or None
+    except Exception:
+        return None
+
+
+def _read_commit() -> str | None:
+    return _stamped_commit() or _git_short("HEAD")     # stamp first; git only for dev
+
+
+_RUNNING_COMMIT = _read_commit()                # frozen at process start (stamp preferred)
 
 
 def _commit_state() -> dict[str, Any]:
-    tree = _git_short("HEAD")
+    # tree = the stamp RE-READ now (the deploy hook rewrites it on each commit), so a
+    # commit-without-restart shows stale — all without a runtime git call.
+    tree = _read_commit()
     return {"running_commit": _RUNNING_COMMIT, "tree_commit": tree,
-            "stale": bool(_RUNNING_COMMIT and tree and _RUNNING_COMMIT != tree)}
+            "stale": bool(_RUNNING_COMMIT and tree and _RUNNING_COMMIT != tree),
+            "commit_source": "stamp" if _stamped_commit() else ("git" if _RUNNING_COMMIT else "unknown")}
 
 
 def _surface_of(parent_or_id: str) -> str:
