@@ -550,10 +550,16 @@ def sm_resolve(req: SMResolveRequest):
             raise HTTPException(status_code=503, detail=f"queue write failed: {e}")
         return {"resolved": True, "new_status": "QUEUED", "decision": "approve",
                 "enqueued": True, "components": comps, "states": states}
-    # non-runnable / no recipe → routed to the operator gate (surfaced, not run)
-    return {"resolved": True, "new_status": "AT-GATE", "decision": "approve",
-            "enqueued": False, "routed": "operator-gate",
-            "note": "no runnable recipe for this item — routed to its gated flow (needs data/build/broker)."}
+    # non-runnable / no recipe → a NAMED gate, never a silent no-op. The capability
+    # manifest says WHY (needs-build / needs-data / needs-broker) so the surface renders a
+    # reason, not nothing. (Under DEF-017 the card's Approve is already disabled with this
+    # reason inline; this is the backstop if a resolve reaches here anyway.)
+    from searchmaster.engine import capability_manifest as _manifest
+    tier, reason = _manifest.gap(req.gate_item_id)
+    return {"resolved": True, "new_status": tier.upper(), "decision": "approve",
+            "enqueued": False, "runnable": False, "routed": tier, "blocker": tier,
+            "reason": reason,
+            "note": f"no runnable recipe for this item — {reason}"}
 
 
 @sm_router.post("/terminus/llm", dependencies=[Depends(require_operator_identity)])
