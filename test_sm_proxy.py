@@ -311,6 +311,7 @@ class TestEnginePowerSwitch(unittest.TestCase):
         self.assertIn("/sm/engine/status", paths)
         self.assertIn("/sm/engine/start", paths)
         self.assertIn("/sm/engine/stop", paths)
+        self.assertIn("/sm/engine/restart", paths)       # reload the discovery worker's code
         self.assertIn("/sm/probe/cancel", paths)         # operator abort of a running probe
 
     def test_engine_module_is_a_power_switch_no_research_or_trading_path(self):
@@ -320,6 +321,45 @@ class TestEnginePowerSwitch(unittest.TestCase):
         for forbidden in ("7687", "TradeNode", "neo4j", "GraphDatabase", "cypher", "ResolveAPI"):
             self.assertNotIn(forbidden, src, f"engine power switch must not reference {forbidden!r}")
         self.assertIn("sc.exe", src)                  # it IS just the service controller
+
+    def test_deny_by_construction_restart_can_never_name_the_trading_engine(self):
+        """DEF-027 firewall: the restart path is structurally incapable of addressing the
+        production trading engine. The ONLY service name any code path can produce is the
+        pinned DISCOVERY_SERVICE constant; the trading engine's name 'SignalDeltaEngine'
+        appears in NO executable string literal (docstrings/comments that say it CAN'T reach
+        it are fine), and no control fn takes a service-name parameter a caller could bend."""
+        import ast, inspect, sm_engine
+        self.assertEqual(sm_engine.DISCOVERY_SERVICE, "SignalDeltaDiscovery")
+        # AST check: gather every docstring node (module + each def/class), then assert no
+        # OTHER string constant names the trading engine — so it can't be a value handed to
+        # sc.exe. Comments aren't in the AST at all, so the firewall prose is exempt too.
+        tree = ast.parse(inspect.getsource(sm_engine))
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                doc = ast.get_docstring(node, clean=False)
+                if doc is not None:
+                    docstrings.add(doc)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value not in docstrings:
+                self.assertNotIn("SignalDeltaEngine", node.value,
+                                 "no executable string literal may name the trading engine")
+        # every control fn's signature has NO service-name parameter — the target is the
+        # module constant, not an argument. Only the action verb is caller-controlled.
+        for fn in (sm_engine.engine_start, sm_engine.engine_stop,
+                   sm_engine.engine_restart, sm_engine.engine_status, sm_engine._sc):
+            params = list(inspect.signature(fn).parameters)
+            self.assertNotIn("service", params, f"{fn.__name__} must not take a service param")
+            self.assertNotIn("name", params, f"{fn.__name__} must not take a name param")
+        # _sc — the single subprocess chokepoint — binds the service name from the constant,
+        # so no action can be routed at any service other than SignalDeltaDiscovery.
+        self.assertIn("DISCOVERY_SERVICE", inspect.getsource(sm_engine._sc))
+
+    def test_engine_restart_is_idempotent_when_not_installed(self):
+        import sm_engine
+        from unittest.mock import patch
+        with patch.object(sm_engine, "engine_status", return_value="not-installed"):
+            self.assertEqual(sm_engine.engine_restart(), "not-installed")
 
 
 class TestServerSideSecrets(unittest.TestCase):

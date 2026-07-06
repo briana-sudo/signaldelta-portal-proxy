@@ -83,3 +83,28 @@ def engine_stop() -> str:
     except Exception:
         return "unknown"
     return engine_status()
+
+
+def engine_restart() -> str:
+    """Restart the discovery service to LOAD CURRENT CODE (a stale worker → fresh). Runs in
+    a background thread so the HTTP response returns before the cycle finishes; the button
+    polls status back to 'running'. HARD-PINNED by construction: every service action here
+    goes through _sc(), whose service name is the DISCOVERY_SERVICE constant — there is no
+    code path in this module that can name SignalDeltaEngine (the trading engine)."""
+    import threading
+    import time
+
+    def _do():
+        try:
+            _sc("stop")
+            for _ in range(20):                   # wait for STOPPED before start (max ~10s)
+                if engine_status() in ("stopped", "not-installed"):
+                    break
+                time.sleep(0.5)
+            _sc("start")
+        except Exception:
+            pass
+    if engine_status() == "not-installed":
+        return "not-installed"
+    threading.Thread(target=_do, daemon=True).start()
+    return "restarting"

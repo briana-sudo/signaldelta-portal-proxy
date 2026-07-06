@@ -867,6 +867,15 @@ def sm_engine_stop():
     return {"action": "stop", "status": engine_stop()}
 
 
+@sm_router.post("/engine/restart", dependencies=[Depends(require_operator_identity)])
+def sm_engine_restart():
+    """Restart the DISCOVERY engine to load current code. Hard-pinned by construction to
+    SignalDeltaDiscovery (sm_engine.DISCOVERY_SERVICE) — this path CANNOT name or cycle
+    SignalDeltaEngine (the trading engine). No service-name parameter exists."""
+    import sm_engine as _e
+    return {"action": "restart", "status": _e.engine_restart(), "service": _e.DISCOVERY_SERVICE}
+
+
 # Controls the SignalDeltaProxy Windows SERVICE (the surface the portal talks to).
 # A power switch, NOT a research/trade action — same auth, no firewall change. The
 # restart is what's needed after a deploy so /sm/readmodel serves live 7688 data.
