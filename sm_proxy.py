@@ -522,8 +522,18 @@ def sm_debrief(req: SMDebriefRequest):
     return db
 
 
-@sm_router.post("/resolve", dependencies=[Depends(require_operator_identity)])
-def sm_resolve(req: SMResolveRequest):
+def _origin(identity: str) -> str:
+    """PROVENANCE (DEF-019): the portal resolve route is the ONLY producer of
+    operator-click, and ONLY from a real Cloudflare-Access identity — an operator email
+    the tunnel injects after SSO, which a client CANNOT forge (CF strips any client-sent
+    copy). The shared-bearer fallback (require_operator_identity returns 'operator@bearer')
+    yields operator-token: a token holder — a shell OR a token-baked browser — never
+    PROVABLY the operator's click. So a bearer-only shell can never stamp operator-click."""
+    return "operator-click" if identity and identity != "operator@bearer" else "operator-token"
+
+
+@sm_router.post("/resolve")
+def sm_resolve(req: SMResolveRequest, identity: str = Depends(require_operator_identity)):
     """Approve/Hold on a board item. Approve on a runnable candidate ENQUEUES ALL of
     its COMPONENT recipe runs (e.g. V-015 -> its 3 flows), one-at-a-time; the item
     disposes fully only when every component concludes. Hold parks it; other tiers
@@ -543,8 +553,10 @@ def sm_resolve(req: SMResolveRequest):
     comps = registry.components_for(req.gate_item_id)
     if comps:
         try:
+            origin = _origin(identity)
             states = [run_queue.enqueue(req.gate_item_id, rid,
-                                        title=registry.get_recipe(rid)["name"]).get("state")
+                                        title=registry.get_recipe(rid)["name"],
+                                        initiated_by=origin).get("state")
                       for rid in comps]
         except Exception as e:                        # 7688 down → honest 503
             raise HTTPException(status_code=503, detail=f"queue write failed: {e}")
@@ -572,15 +584,15 @@ def sm_terminus_llm(req: SMTerminusLLMRequest):
     return sm_analyst.raw(req.system, req.user, req.max_tokens)
 
 
-@sm_router.post("/reevaluate", dependencies=[Depends(require_operator_identity)])
-def sm_reevaluate(req: SMReevaluateRequest):
+@sm_router.post("/reevaluate")
+def sm_reevaluate(req: SMReevaluateRequest, identity: str = Depends(require_operator_identity)):
     """Enqueue a RE-TERMINUS job (the operator's Re-evaluate / deliberate-review click)
     for a concluded board item. The ENGINE re-judges its OWN stored work with the fixed
     taxonomy + LLM; this endpoint only writes a run-REQUEST (the runner does the work,
     streaming to the In-progress tab). FIREWALL: no probe, no buy, no trading instance."""
     try:
         run_queue, _ = _sm_engine()
-        return run_queue.enqueue_reterminus(req.item_id)
+        return run_queue.enqueue_reterminus(req.item_id, initiated_by=_origin(identity))
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"engine unavailable: {e}")
 

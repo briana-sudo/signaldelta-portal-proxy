@@ -86,6 +86,26 @@ class TestAuthOffTheClient(unittest.TestCase):
             del os.environ["PROXY_API_TOKEN"]
 
 
+class TestOriginDenyByConstruction(unittest.TestCase):
+    """PROVENANCE (DEF-019): operator-click is producible ONLY from a real Cloudflare-Access
+    identity (a browser-SSO email the tunnel injects + a client cannot forge). A bearer
+    caller — a shell OR a token-baked browser — is operator-token, never operator-click."""
+    def test_operator_click_only_from_cf_identity(self):
+        self.assertEqual(sm_proxy._origin("brian@kaskaskia.com"), "operator-click")
+        self.assertEqual(sm_proxy._origin("operator@bearer"), "operator-token")   # shared bearer
+        self.assertEqual(sm_proxy._origin(""), "operator-token")
+        self.assertEqual(sm_proxy._origin(None), "operator-token")
+
+    def test_only_the_resolve_route_stamps_operator_click(self):
+        # structural: no other engine/proxy path passes 'operator-click' into enqueue —
+        # the default is code-shell, so a shell can never forge the operator.
+        import inspect
+        src = inspect.getsource(sm_proxy)
+        # the sole producer is _origin, called only from the two authenticated routes
+        self.assertEqual(src.count('"operator-click"'), 1)   # only inside _origin
+        self.assertIn("initiated_by=origin", src)            # resolve threads the derived origin
+
+
 class TestAllowlistRunsBeforeTheDriver(unittest.TestCase):
     def test_write_rejected_by_allowlist_not_the_db(self):
         # a write is rejected at the allowlist (400) — it never reaches a driver,
