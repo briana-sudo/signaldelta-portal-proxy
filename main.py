@@ -577,7 +577,7 @@ def storm_pull(req: PullRequest):
 SPEND_CLI_TIMEOUT = 150
 
 
-def _run_engine_cli(command: str, payload: dict) -> dict:
+def _run_engine_cli(command: str, payload: dict, timeout: int = SPEND_CLI_TIMEOUT) -> dict:
     """Invoke `python -m storm.portal_api <command> --json <payload>` in the engine venv and
     return the parsed last JSON line. The engine is the single source of the solve/approve."""
     if not os.path.exists(STORM_ENGINE_PY):
@@ -586,7 +586,7 @@ def _run_engine_cli(command: str, payload: dict) -> dict:
         proc = subprocess.run(
             [STORM_ENGINE_PY, "-m", "storm.portal_api", command, "--json", json.dumps(payload)],
             cwd=STORM_ENGINE_ROOT, env={**os.environ, "PYTHONPATH": STORM_ENGINE_ROOT},
-            capture_output=True, text=True, timeout=SPEND_CLI_TIMEOUT)
+            capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail=f"engine {command} timed out")
     lines = [ln for ln in (proc.stdout or "").strip().splitlines() if ln.strip()]
@@ -628,9 +628,28 @@ class TokenReq(BaseModel):
     actor: str = "operator"
 
 
+class SolveGeometryReq(BaseModel):
+    date: str
+    hail_floor: float = 1.80
+    objective: str = "dial"
+    peril: str = "hail"
+    asof: str | None = None
+    spend_cap: float | None = None
+    persist: bool = False
+
+
 @app.post("/spend_solve", dependencies=[Depends(require_bearer)])
 def spend_solve(req: SpendSolveReq):
     return _run_engine_cli("spend-solve", req.dict())          # READ-ONLY (writes nothing)
+
+
+@app.post("/solve_geometry", dependencies=[Depends(require_bearer)])
+def solve_geometry(req: SolveGeometryReq):
+    # SOLVE-GEOMETRY layer (fresh dial circles). READ-ONLY. The engine CLI tries the resident
+    # KCCSolveEngine (~3s warm) and falls back to the cold path (~200s: two GPKG joins) — a longer
+    # timeout than spend-solve so the cold first-solve of a date doesn't 504 before KCCSolveEngine
+    # is installed. Warm solves return well under this.
+    return _run_engine_cli("solve-geometry", req.dict(), timeout=240)
 
 
 @app.post("/spend_approve", dependencies=[Depends(require_write_bearer)])
