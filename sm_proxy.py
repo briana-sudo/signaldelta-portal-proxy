@@ -522,6 +522,17 @@ def sm_debrief(req: SMDebriefRequest):
     return db
 
 
+def _card_recipe_id(item_id: str) -> str | None:
+    """The recipe a board card DECLARES it runs (b.recipe_id), read from 7688. Fix #1:
+    a card's item_id need not pattern-match a recipe (e.g. a drill) — the card carries the
+    runnable recipe id, and resolve enqueues what the card declares."""
+    driver = get_sm_driver()
+    with driver.session(database=SM_NEO4J_DATABASE, default_access_mode="READ") as s:
+        rec = s.run(f"MATCH (b:SMBoardItem {{item_id:$i}}) WHERE {_BRANCH_ISOLATION} "
+                    "RETURN b.recipe_id AS r", i=item_id).single()
+        return rec["r"] if rec else None
+
+
 def _origin(identity: str) -> str:
     """PROVENANCE (DEF-019): the portal resolve route is the ONLY producer of
     operator-click, and ONLY from a real Cloudflare-Access identity — an operator email
@@ -551,6 +562,13 @@ def sm_resolve(req: SMResolveRequest, identity: str = Depends(require_operator_i
         raise HTTPException(status_code=503, detail=f"engine unavailable: {e}")
 
     comps = registry.components_for(req.gate_item_id)
+    if not comps:
+        # FIX #1: the id didn't pattern-match a recipe — enqueue the card's DECLARED
+        # recipe_id if it is a real runnable recipe (a drill / any card whose item_id
+        # differs from its recipe). Never invents a recipe: it must resolve in the registry.
+        declared = _card_recipe_id(req.gate_item_id)
+        if declared and registry.has_recipe(declared):
+            comps = [declared]
     if comps:
         try:
             origin = _origin(identity)
