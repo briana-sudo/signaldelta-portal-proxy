@@ -528,7 +528,15 @@ def sm_debrief(req: SMDebriefRequest):
     grounding = _debrief.assemble_grounding(run, lessons=lessons, board=board,
                                             watches=watches, proposals=notes)
     db = _debrief.compose_debrief(grounding, llm_call=_proxy_llm)
-    db["run_id"] = req.run_id
+    # COMPOSITION ASSERTION (DEF-028): stamp run_id + grounded={t,n,edge} from THIS run and
+    # refuse a debrief that doesn't quote its own numbers. assemble_grounding parses the
+    # node's JSON-string `result`, so the grounding quotes the real t (was: AttributeError
+    # here → the console fell back to a canned mock debrief quoting a foreign t=1.09).
+    try:
+        _debrief.stamp_and_verify(db, req.run_id, run.get("result"), grounding)
+    except _debrief.DebriefMisgrounded as e:
+        return {"error": str(e), "run_id": req.run_id,
+                "unavailable": [{"voice": "*", "reason": "debrief not grounded in this run"}]}
     db["markdown"] = _debrief.render_markdown(db)
     return db
 
