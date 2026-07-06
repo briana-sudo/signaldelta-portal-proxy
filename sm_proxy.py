@@ -174,6 +174,17 @@ class SMDebriefRequest(BaseModel):
     run: dict[str, Any] | None = None                 # optional inline run (else fetched from 7688)
 
 
+class SMDebriefCardRequest(BaseModel):
+    run_id: str                                       # the run whose debrief spawned this
+    target_key: str                                   # canonical test key — dedup handle (no twins)
+    title: str
+    asks: list[dict[str, Any]] = Field(default_factory=list)   # [{voice, text}] — converging asks
+    tier_hint: str = "build"                          # 'owned-retest' | 'purchase' | 'build'
+    recipe_ref: str | None = None                     # for an owned-retest that maps to a real recipe
+    price: str = ""                                   # for a purchase ask (shown on the card)
+    ev: float = 0.4
+
+
 # --- the router --------------------------------------------------------------
 sm_router = APIRouter(prefix="/sm", tags=["search-master"])
 
@@ -590,6 +601,58 @@ def sm_resolve(req: SMResolveRequest, identity: str = Depends(require_operator_i
             "enqueued": False, "runnable": False, "routed": tier, "blocker": tier,
             "reason": reason,
             "note": f"no runnable recipe for this item — {reason}"}
+
+
+@sm_router.post("/debrief/card", dependencies=[Depends(require_operator_identity)])
+def sm_debrief_card(req: SMDebriefCardRequest):
+    """DEBRIEF-TO-CARD (DEF-026): turn an advising-voice claim into a PROPOSAL board card
+    through the CONSTRUCTOR (make_card/persist_card) — auto-tiered by what the ask needs.
+    It NEVER enqueues and NEVER runs: it writes a PENDING proposal the operator gates;
+    Approve stays the only spend. Idempotent by (run_id → surface, target_key): a repeat
+    debrief re-uses the spawned card (no twins), and the spawn is recorded on the card."""
+    if r"C:\SignalDelta_Local" not in _sys.path:
+        _sys.path.insert(0, r"C:\SignalDelta_Local")
+    from searchmaster.engine import recipe_registry
+    from searchmaster.engine.decision_card import make_card, persist_card, CardRejected
+
+    surface = _surface_of(req.run_id)
+    item_id = f"D:{surface}-{req.target_key}"
+    # auto-tier BY NEED: an owned-data re-test that resolves to a real recipe → runnable-now
+    # (wired); a purchase → needs-data with the price; anything else (a new construction /
+    # missing tool) → needs-build. make_card enforces the tier honestly.
+    recipe_ref = req.recipe_ref if (req.tier_hint == "owned-retest" and req.recipe_ref
+                                    and recipe_registry.has_recipe(req.recipe_ref)) else None
+    if recipe_ref:
+        blocker, reason = None, None
+    elif req.tier_hint == "purchase":
+        blocker = "needs-data"
+        reason = f"gated on a purchase — {req.price or 'price to be researched'}"
+    else:
+        blocker = "needs-build"
+        reason = "a new construction / tool the engine does not yet have — a build item (from the debrief)."
+    driver = get_sm_driver()
+    with driver.session(database=SM_NEO4J_DATABASE) as s:
+        exists = s.run(f"MATCH (b:SMBoardItem {{item_id:$i}}) WHERE {_BRANCH_ISOLATION} "
+                       "RETURN b.tier AS tier", i=item_id).single()
+        if exists:
+            return {"created": False, "item_id": item_id, "duplicate": True, "tier": exists["tier"],
+                    "note": "this test was already spawned from a debrief — no twin created"}
+        try:
+            card = make_card(
+                item_id=item_id, title=req.title[:70], type="debrief-suggestion",
+                recipe_ref=recipe_ref, blocker=blocker, reason=reason,
+                recommendation="; ".join(a.get("text", "") for a in req.asks)[:400],
+                meta=([f"from {len(req.asks)} voice(s): " + ", ".join(sorted({a.get('voice', '') for a in req.asks}))]
+                      + ([req.price] if req.price else [])),
+                ev=req.ev, provenance="derived",
+                extra={"derived_from": surface, "spawned_from": req.run_id, "spawn_key": req.target_key,
+                       "asks": json.dumps(req.asks), "proposal": True})
+            persist_card(s, card)
+        except CardRejected as e:
+            raise HTTPException(status_code=422, detail=f"card rejected by constructor: {e}")
+    # NOTE: no run_queue.enqueue anywhere in this path — a proposal only.
+    return {"created": True, "item_id": item_id, "tier": card["tier"], "spawn_key": req.target_key,
+            "approve_enabled": card["approve_enabled"]}
 
 
 @sm_router.post("/terminus/llm", dependencies=[Depends(require_operator_identity)])
