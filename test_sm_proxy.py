@@ -418,5 +418,58 @@ class TestCommitStampNotRuntimeGit(unittest.TestCase):
             sm_proxy._VERSION_FILE = orig
 
 
+class TestEngineChipTreeSideIsLiveHead(unittest.TestCase):
+    """DEF-028 follow-up: the engine chip's TREE side must read the ENGINE tree's LIVE disk
+    HEAD (like the proxy's own chip), not a frozen deploy stamp. The old wiring compared the
+    running commit against engine_version.json, which lagged HEAD by a day and false-flagged
+    'reload' on a worker already running HEAD."""
+    def _with_engine_state(self, running_commit, stamp_commit):
+        import json, tempfile, os
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "engine_service.json"), "w", encoding="utf-8") as f:
+            json.dump({"commit": running_commit, "status": "running"}, f)
+        with open(os.path.join(d, "engine_version.json"), "w", encoding="utf-8") as f:
+            json.dump({"commit": stamp_commit}, f)                 # a STALE deploy stamp
+        return d
+
+    def test_chip_is_clean_when_running_equals_disk_head(self):
+        # running worker == disk HEAD == cb71dbe, but the deploy stamp is STALE (45d6f8b).
+        # The chip must read CLEAN (not stale) — the tree side is live HEAD, not the stamp.
+        d = self._with_engine_state("cb71dbe", "45d6f8b")
+        orig_dir, orig_head = sm_proxy._ENGINE_STATE_DIR, sm_proxy._engine_tree_commit
+        sm_proxy._ENGINE_STATE_DIR = d
+        sm_proxy._engine_tree_commit = lambda: "cb71dbe"          # live disk HEAD
+        try:
+            st = sm_proxy._engine_commit_state()
+            self.assertEqual(st["engine_commit"], "cb71dbe")
+            self.assertEqual(st["engine_tree_commit"], "cb71dbe") # HEAD, NOT the stale stamp 45d6f8b
+            self.assertFalse(st["engine_stale"])                  # CLEAN — no false 'reload'
+        finally:
+            sm_proxy._ENGINE_STATE_DIR, sm_proxy._engine_tree_commit = orig_dir, orig_head
+
+    def test_chip_is_stale_when_worker_predates_disk_head(self):
+        # a genuinely stale worker: running an old commit while disk HEAD advanced → reload ⚠.
+        d = self._with_engine_state("0ldc0de", "45d6f8b")
+        orig_dir, orig_head = sm_proxy._ENGINE_STATE_DIR, sm_proxy._engine_tree_commit
+        sm_proxy._ENGINE_STATE_DIR = d
+        sm_proxy._engine_tree_commit = lambda: "cb71dbe"          # HEAD moved past the worker
+        try:
+            st = sm_proxy._engine_commit_state()
+            self.assertTrue(st["engine_stale"])                   # TRUE stale — worker behind HEAD
+        finally:
+            sm_proxy._ENGINE_STATE_DIR, sm_proxy._engine_tree_commit = orig_dir, orig_head
+
+    def test_tree_side_falls_back_to_stamp_only_when_git_absent(self):
+        d = self._with_engine_state("cb71dbe", "45d6f8b")
+        orig_dir, orig_head = sm_proxy._ENGINE_STATE_DIR, sm_proxy._engine_tree_commit
+        sm_proxy._ENGINE_STATE_DIR = d
+        sm_proxy._engine_tree_commit = lambda: None               # git unavailable
+        try:
+            st = sm_proxy._engine_commit_state()
+            self.assertEqual(st["engine_tree_commit"], "45d6f8b") # stamp is the git-less fallback
+        finally:
+            sm_proxy._ENGINE_STATE_DIR, sm_proxy._engine_tree_commit = orig_dir, orig_head
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

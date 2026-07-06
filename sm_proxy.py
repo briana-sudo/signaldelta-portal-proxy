@@ -298,19 +298,41 @@ if _RUNNING_COMMIT and _RUNNING_COMMIT != _stamped_commit():
 
 
 _ENGINE_STATE_DIR = r"C:\SignalDelta_Local\searchmaster\state"
+_ENGINE_REPO_DIR = r"C:\SignalDelta_Local"                       # the engine's git tree (root repo)
+_ENGINE_SAFE = ("-c", f"safe.directory={_ENGINE_REPO_DIR}", "-c", "safe.directory=*")
+
+
+def _engine_tree_commit() -> str | None:
+    """LIVE disk HEAD of the ENGINE tree — read the SAME way the proxy reads its own commit
+    (git rev-parse, safe under LocalSystem + install-path fallback). This is the TREE side of
+    the engine chip. DEF-028 follow-up: the tree side must track the ACTUAL tree, not a frozen
+    deploy stamp (engine_version.json) that only a manual re-stamp advances — that stamp lagged
+    a full day behind HEAD and false-flagged 'reload' on a worker already running HEAD."""
+    for gitexe in _GIT_BINS:
+        try:
+            r = _subp.run([gitexe, *_ENGINE_SAFE, "-C", _ENGINE_REPO_DIR, "rev-parse", "--short", "HEAD"],
+                          capture_output=True, text=True, timeout=8)
+            out = (r.stdout or "").strip()
+            if r.returncode == 0 and out:
+                return out
+        except Exception:
+            continue
+    return None
 
 
 def _engine_commit_state() -> dict[str, Any]:
-    """The DISCOVERY ENGINE's commit — running (from its heartbeat, stamped at process
-    start) vs deployed (its version stamp). Answers 'is the engine current' with a chip,
-    never pid-vs-commit-time archaeology. Files only; no runtime git."""
+    """The DISCOVERY ENGINE's commit — RUNNING (from its heartbeat, stamped at process start)
+    vs the tree's LIVE disk HEAD (git, exactly like the proxy's own chip). 'Is the engine
+    current' is a chip: stale ONLY when the running commit differs from disk HEAD. The deploy
+    stamp (engine_version.json) is a git-less FALLBACK for the tree, never the primary source."""
     def _c(fname):
         try:
             with open(os.path.join(_ENGINE_STATE_DIR, fname), encoding="utf-8") as f:
                 return (json.load(f) or {}).get("commit")
         except Exception:
             return None
-    run_c, tree_c = _c("engine_service.json"), _c("engine_version.json")
+    run_c = _c("engine_service.json")
+    tree_c = _engine_tree_commit() or _c("engine_version.json")   # live HEAD; stamp only if git absent
     return {"engine_commit": run_c, "engine_tree_commit": tree_c,
             "engine_stale": bool(run_c and tree_c and run_c != tree_c)}
 
