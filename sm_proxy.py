@@ -528,8 +528,8 @@ def _card_recipe_id(item_id: str) -> str | None:
     runnable recipe id, and resolve enqueues what the card declares."""
     driver = get_sm_driver()
     with driver.session(database=SM_NEO4J_DATABASE, default_access_mode="READ") as s:
-        rec = s.run(f"MATCH (b:SMBoardItem {{item_id:$i}}) WHERE {_BRANCH_ISOLATION} "
-                    "RETURN b.recipe_id AS r", i=item_id).single()
+        rec = s.run(f"MATCH (n:SMBoardItem {{item_id:$i}}) WHERE {_BRANCH_ISOLATION} "
+                    "RETURN n.recipe_id AS r", i=item_id).single()          # alias 'n' matches _BRANCH_ISOLATION
         return rec["r"] if rec else None
 
 
