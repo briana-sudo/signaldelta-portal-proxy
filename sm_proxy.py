@@ -944,6 +944,9 @@ def sm_engine_restart():
     SignalDeltaDiscovery (sm_engine.DISCOVERY_SERVICE) — this path CANNOT name or cycle
     SignalDeltaEngine (the trading engine). No service-name parameter exists."""
     import sm_engine as _e
+    import time as _t
+    _e._trace("ENDPOINT /sm/engine/restart received")     # DEF-030 freeze: proves the POST arrived
+    t0 = _t.monotonic()
     res = _e.engine_restart()
     # final verify the endpoint CAN do (it has git): the re-spawned worker's stamp advanced
     # to disk HEAD. If not, the chip would still read stale — say so, don't claim success.
@@ -954,6 +957,7 @@ def sm_engine_restart():
             res.update({"ok": False, "hop": "stamp",
                         "reason": f"worker re-spawned (pid {res.get('new_pid')}) but is on {new}, "
                                   f"not disk HEAD {head} — stamp-on-start failed; the chip stays stale."})
+    _e._trace(f"ENDPOINT returning ok={res.get('ok')} hop={res.get('hop')} took={_t.monotonic() - t0:.1f}s")
     return res
 
 

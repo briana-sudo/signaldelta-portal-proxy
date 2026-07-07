@@ -29,6 +29,17 @@ _TIMEOUT = 20
 # the discovery worker's OWN heartbeat — read-only; how a restart is VERIFIED (a new pid),
 # never assumed. Reading it grants NO service-control capability (deny-by-construction holds).
 _STATE_FILE = _Path(r"C:\SignalDelta_Local\searchmaster\state\engine_service.json")
+# DEF-030 freeze: server-hop trace — every restart hop appends here (read-only capture).
+_TRACE_FILE = _Path(r"C:\SignalDelta_Local\searchmaster\state\engine_restart_trace.log")
+
+
+def _trace(event: str) -> None:
+    try:
+        from datetime import datetime, timezone
+        with _TRACE_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} {event}\n")
+    except Exception:
+        pass
 
 
 def _sc(action: str) -> subprocess.CompletedProcess:
@@ -121,6 +132,8 @@ def engine_stop() -> str:
 def _result(ok: bool, status: str, hop: str | None, reason: str | None,
             before: dict, after: dict | None = None) -> dict[str, Any]:
     after = after or {}
+    _trace(f"RESULT ok={ok} hop={hop} status={status} "
+           f"old_pid={before.get('pid')} new_pid={after.get('pid')} reason={reason}")
     return {"ok": ok, "status": status, "hop": hop, "reason": reason,
             "old_pid": before.get("pid"), "new_pid": after.get("pid"),
             "old_commit": before.get("commit"), "new_commit": after.get("commit"),
@@ -134,14 +147,17 @@ def engine_restart() -> dict[str, Any]:
     The proxy stays alive throughout (it cycles a DIFFERENT service), so it CAN verify — this
     is NOT the proxy-self-restart case. Still hard-pinned to DISCOVERY_SERVICE: every _sc()
     call names the constant; no code path here can name SignalDeltaEngine (trading)."""
+    _trace("ENTER engine_restart")
     if engine_status() == "not-installed":
         return _result(False, "not-installed", "install",
                        "SignalDeltaDiscovery is not installed — run Setup Discovery once.", {})
     before = _worker_state()
+    _trace(f"before pid={before.get('pid')} commit={before.get('commit')}")
 
     # HOP 1 — STOP, verified it reaches STOPPED
     try:
         r = _sc("stop")
+        _trace(f"sc-stop rc={r.returncode} out={(r.stdout or '').strip()[:80]!r} err={(r.stderr or '').strip()[:80]!r}")
     except Exception as e:
         return _result(False, engine_status(), "stop", f"sc stop raised: {type(e).__name__}: {e}", before)
     if not _wait_until(lambda: engine_status() in ("stopped", "not-installed"), 12):
@@ -152,6 +168,7 @@ def engine_restart() -> dict[str, Any]:
     # HOP 2 — START, verified it reaches RUNNING
     try:
         r2 = _sc("start")
+        _trace(f"sc-start rc={r2.returncode} out={(r2.stdout or '').strip()[:80]!r} err={(r2.stderr or '').strip()[:80]!r}")
     except Exception as e:
         return _result(False, engine_status(), "start", f"sc start raised: {type(e).__name__}: {e}", before)
     if not _wait_until(lambda: engine_status() == "running", 20):
