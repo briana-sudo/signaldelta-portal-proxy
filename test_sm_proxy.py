@@ -291,10 +291,11 @@ class TestInstanceIsolation(unittest.TestCase):
         self.assertTrue(SM_NEO4J_URI.endswith(":7688"), SM_NEO4J_URI)
 
     def test_no_trading_engine_labels_leaked(self):
-        import inspect
-        src = inspect.getsource(sm_proxy)
-        # branch-isolation backstop references KCC/KTM only as an EXCLUSION filter
-        self.assertIn("NOT n:KCCNode AND NOT n:KTMNode", src)
+        # branch-isolation backstop references KCC/KTM only as an EXCLUSION filter. Post
+        # DEF-029 the predicate is built by _branch_isolation(alias) (alias-safe) rather than
+        # a bare constant — assert the PRODUCED predicate, not a source substring.
+        self.assertEqual(sm_proxy._BRANCH_ISOLATION, "NOT n:KCCNode AND NOT n:KTMNode")
+        self.assertEqual(sm_proxy._branch_isolation("n"), "NOT n:KCCNode AND NOT n:KTMNode")
 
 
 class TestEnginePowerSwitch(unittest.TestCase):
@@ -360,6 +361,64 @@ class TestEnginePowerSwitch(unittest.TestCase):
         from unittest.mock import patch
         with patch.object(sm_engine, "engine_status", return_value="not-installed"):
             self.assertEqual(sm_engine.engine_restart(), "not-installed")
+
+
+class TestBranchIsolationAliasHygiene(unittest.TestCase):
+    """DEF-029 (a DEF-023 recurrence): the KCC/KTM isolation predicate must be spliced with
+    the SAME alias the MATCH binds. The n-aliased constant spliced into a `b`-aliased MATCH
+    yielded 'Variable n not defined' → 500 on EVERY /sm/debrief/card click."""
+    def test_helper_binds_the_alias(self):
+        self.assertEqual(sm_proxy._branch_isolation("b"), "NOT b:KCCNode AND NOT b:KTMNode")
+        self.assertEqual(sm_proxy._branch_isolation(), "NOT n:KCCNode AND NOT n:KTMNode")
+        self.assertEqual(sm_proxy._BRANCH_ISOLATION, "NOT n:KCCNode AND NOT n:KTMNode")
+
+    def test_dup_check_query_parses_alias_is_consistent(self):
+        import re
+        # the exact /sm/debrief/card dup-check query — its MATCH alias must equal its
+        # isolation-predicate alias, or Cypher raises 'Variable <alias> not defined'.
+        q = (f"MATCH (b:SMBoardItem {{item_id:$i}}) WHERE {sm_proxy._branch_isolation('b')} "
+             "RETURN b.tier AS tier")
+        self.assertEqual(re.search(r"MATCH \((\w+):", q).group(1),
+                         re.search(r"NOT (\w+):KCCNode", q).group(1))     # 'b' == 'b'
+        self.assertNotIn("NOT n:", q)                                     # no stray n-splice
+
+    def test_static_guard_no_alias_mismatch_in_source(self):
+        import inspect, re
+        src = inspect.getsource(sm_proxy)
+        problems = []
+        # (a) the n-aliased CONSTANT spliced into a non-n MATCH (same line)
+        for m in re.finditer(r"MATCH \(([a-z]\w*):[^\n]*\b_BRANCH_ISOLATION\b", src):
+            if m.group(1) != "n":
+                problems.append(f"_BRANCH_ISOLATION(n) under MATCH ({m.group(1)}:…)")
+        # (b) _branch_isolation('X') spliced into a MATCH with a DIFFERENT alias (same line)
+        for m in re.finditer(r"MATCH \(([a-z]\w*):[^\n]*_branch_isolation\('([a-z]\w*)'\)", src):
+            if m.group(1) != m.group(2):
+                problems.append(f"_branch_isolation('{m.group(2)}') under MATCH ({m.group(1)}:…)")
+        self.assertEqual(problems, [], f"branch-isolation alias mismatch(es): {problems}")
+
+
+class TestFaithfulRecipeBinding(unittest.TestCase):
+    """DEF-029 invariant: a card may bind a recipe ONLY when the ask faithfully maps to it.
+    Glint 2 ('pool TOM+TDF into a composite') spuriously matched a window-extension recipe."""
+    GLINT2 = ("Sign-consistency across V-015 family warrants a pooled/composite event test. "
+              "Cheapest check: pool TOM + TDF quarter-end events into one combined V-015-COMPOSITE "
+              "run; all payment-cycle windows are stacked into a single event series; no new data.")
+
+    def test_glint2_ask_cannot_bind_the_window_extension_recipe(self):
+        ok, why = sm_proxy._faithful_recipe("V-015-TOM-2006", self.GLINT2, "V-015-TOM-FULL")
+        self.assertFalse(ok)                              # the composite ask does NOT bind -2006
+        self.assertIn("faithful", why.lower())
+
+    def test_genuine_window_extension_ask_binds(self):
+        ok, _ = sm_proxy._faithful_recipe("V-015-TOM-2006",
+                                          "extend the window back to 2006 for more power", "V-015-TOM-FULL")
+        self.assertTrue(ok)                               # a real extension ask DOES bind
+
+    def test_cross_surface_recipe_is_never_faithful(self):
+        ok, why = sm_proxy._faithful_recipe("V-099-OTHER-2006",
+                                            "extend the window to 2006", "V-015-TOM-FULL")
+        self.assertFalse(ok)                              # not a re-test of THIS surface
+        self.assertIn("not a re-test", why.lower())
 
 
 class TestServerSideSecrets(unittest.TestCase):

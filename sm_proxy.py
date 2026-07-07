@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re as _re
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -49,8 +50,15 @@ SM_NEO4J_USER = os.environ.get("SM_NEO4J_USER", "neo4j")
 SM_NEO4J_PASSWORD = os.environ.get("SM_NEO4J_PASSWORD")
 SM_NEO4J_DATABASE = os.environ.get("SM_NEO4J_DATABASE", "neo4j")
 
-# the KCC/KTM within-instance hygiene backstop (NOT the isolation — §6)
-_BRANCH_ISOLATION = "NOT n:KCCNode AND NOT n:KTMNode"
+# the KCC/KTM within-instance hygiene backstop (NOT the isolation — §6).
+# DEF-023/029: the predicate MUST be spliced with the SAME alias the MATCH binds. Splicing
+# the n-aliased constant into a query whose node is aliased `b` yields "Variable n not
+# defined" → 500. _branch_isolation(alias) makes the alias explicit so it can never mismatch.
+def _branch_isolation(alias: str = "n") -> str:
+    return f"NOT {alias}:KCCNode AND NOT {alias}:KTMNode"
+
+
+_BRANCH_ISOLATION = _branch_isolation("n")       # back-compat: the n-aliased sites use this
 
 _sm_driver = None                                # lazily-opened 7688 driver singleton
 _secrets = SecretsStore(os.environ.get("SM_SECRETS_DIR"))
@@ -353,6 +361,26 @@ def _surface_of(parent_or_id: str) -> str:
     return p.split(":")[-1] if ":" in p else p
 
 
+def _faithful_recipe(recipe_ref: str, ask_text: str, surface: str) -> tuple[bool, str]:
+    """DEF-029 invariant: does `recipe_ref` FAITHFULLY match the ask? A card may bind a recipe
+    only when it does; otherwise the ask ties needs-build with its text carried. Two gates:
+      (1) same construction — the recipe must be a re-test of THIS surface's base recipe;
+      (2) a windowed re-test (…-YYYY) requires the ask to EXPLICITLY request extending the
+          window/history AND to carry no competing computation (pool/composite/split/…).
+    This is what stops a 'pool composite' glint from wiring to a window-extension recipe just
+    because it contained the substring 'windows'."""
+    text = str(ask_text or "").lower()
+    base = _re.sub(r"-(FULL|\d{4})$", "", str(surface or ""))
+    if base and not str(recipe_ref).startswith(base):
+        return False, f"recipe {recipe_ref} is not a re-test of {base} — not a faithful match, filed as a build proposal."
+    if _re.search(r"-\d{4}$", str(recipe_ref)):
+        wants_window = bool(_re.search(r"\bextend\b|\blonger\b|more years|full history|\bhistory\b|back to|window to|to (19|20)\d\d", text))
+        competing = bool(_re.search(r"\bpool\b|composite|combine|\bstack|\bmerge\b|\bsplit\b|tercile|sub-?group|sub-?population|sub-?calendar", text))
+        if not wants_window or competing:
+            return False, "ask does not faithfully request a window extension — filed as a build proposal."
+    return True, ""
+
+
 def _derive_cell_status(grid: list[dict[str, Any]], runs: list[dict[str, Any]]) -> None:
     """MAP LIVENESS — cell status is DERIVED from the component RUN RESULTS via the
     fixed taxonomy AT READ TIME, not read from a stored (mutable, go-stale) cell.
@@ -647,11 +675,21 @@ def sm_debrief_card(req: SMDebriefCardRequest):
 
     surface = _surface_of(req.run_id)
     item_id = f"D:{surface}-{req.target_key}"
+    ask_text = "; ".join(a.get("text", "") for a in (req.asks or [])).strip()
     # auto-tier BY NEED: an owned-data re-test that resolves to a real recipe → runnable-now
     # (wired); a purchase → needs-data with the price; anything else (a new construction /
     # missing tool) → needs-build. make_card enforces the tier honestly.
     recipe_ref = req.recipe_ref if (req.tier_hint == "owned-retest" and req.recipe_ref
                                     and recipe_registry.has_recipe(req.recipe_ref)) else None
+    # THE FAITHFULNESS INVARIANT (DEF-029): a card may bind a recipe ONLY when the ask
+    # faithfully maps to it. An unfaithful/ambiguous ask (e.g. a 'pool composite' glint that
+    # spuriously matched a window-extension recipe) drops the binding → needs-build carrying
+    # the ask verbatim, never a runnable card wired to a DIFFERENT experiment than the ask.
+    unfaithful = None
+    if recipe_ref:
+        ok, why = _faithful_recipe(recipe_ref, ask_text, surface)
+        if not ok:
+            recipe_ref, unfaithful = None, why
     if recipe_ref:
         blocker, reason = None, None
     elif req.tier_hint == "purchase":
@@ -659,10 +697,11 @@ def sm_debrief_card(req: SMDebriefCardRequest):
         reason = f"gated on a purchase — {req.price or 'price to be researched'}"
     else:
         blocker = "needs-build"
-        reason = "a new construction / tool the engine does not yet have — a build item (from the debrief)."
+        base_reason = unfaithful or "a new construction / tool the engine does not yet have — a build item (from the debrief)."
+        reason = f"{base_reason} Ask (verbatim): {ask_text[:300]}" if ask_text else base_reason
     driver = get_sm_driver()
     with driver.session(database=SM_NEO4J_DATABASE) as s:
-        exists = s.run(f"MATCH (b:SMBoardItem {{item_id:$i}}) WHERE {_BRANCH_ISOLATION} "
+        exists = s.run(f"MATCH (b:SMBoardItem {{item_id:$i}}) WHERE {_branch_isolation('b')} "
                        "RETURN b.tier AS tier", i=item_id).single()
         if exists:
             return {"created": False, "item_id": item_id, "duplicate": True, "tier": exists["tier"],
