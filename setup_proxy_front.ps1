@@ -5,14 +5,16 @@
 #   2. Installs an always-up front reverse proxy (SM_ProxyFront) on :8000 that
 #      upstreams to the app on :8001 and HOLDS requests across an app restart
 #      instead of surfacing a 502.
-#   cloudflared is UNCHANGED — it still points at :8000, which is now the front.
+#   cloudflared is UNCHANGED - it still points at :8000, which is now the front.
 #
 # After this, an "Update & restart" bounces only the app on :8001; the front on
 # :8000 stays up, so the browser never sees a 502 during a deploy. One-time; safe
 # to re-run (idempotent).
 #
-# nssm prints to stderr on benign cases, so we DON'T abort on those — the real
+# nssm prints to stderr on benign cases, so we DON'T abort on those - the real
 # success signal is the front answering on :8000 and proxying /health at the end.
+# ASCII-ONLY on purpose: Windows PowerShell 5.1 reads a UTF-8-without-BOM .ps1 as
+# cp1252, so a non-ASCII char (e.g. an em-dash) would corrupt parsing.
 $ErrorActionPreference = "Continue"
 
 try {
@@ -29,7 +31,7 @@ try {
     if (-not $py)                { throw "No python found ($dir\.venv\Scripts\python.exe or PATH)." }
     if (-not (Test-Path $nssm))  { throw "nssm not found at $nssm." }
     if (-not (Test-Path $script)){ throw "sm_proxy_front.py not found at $script." }
-    if (-not (Get-Service $proxy -ErrorAction SilentlyContinue)) { throw "$proxy is not installed — run the proxy setup first." }
+    if (-not (Get-Service $proxy -ErrorAction SilentlyContinue)) { throw "$proxy is not installed - run the proxy setup first." }
 
     # 1) Repoint the app to :8001 and restart it there (frees :8000 for the front).
     Write-Host "[front] repointing $proxy to 127.0.0.1:8001 ..."
@@ -70,9 +72,9 @@ try {
 
     Write-Host ""
     if ($frontOk -and $throughOk) {
-        Write-Host "FRONT READY — graceful restart active." -ForegroundColor Green
+        Write-Host "FRONT READY - graceful restart active." -ForegroundColor Green
         Write-Host "cloudflared still points at :8000 (now the front); the app runs on :8001."
-        Write-Host "An Update & restart now bounces only :8001 — the browser no longer 502s during a deploy."
+        Write-Host "An Update and restart now bounces only :8001 - the browser no longer 502s during a deploy."
     } else {
         Write-Host ("Front install incomplete (front={0}, through={1})." -f $frontOk, $throughOk) -ForegroundColor Yellow
         Write-Host "See $dir\sm_front.log and the proxy log. Re-run this setup safely, or roll back with:"
