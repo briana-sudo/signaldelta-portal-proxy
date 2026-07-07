@@ -484,10 +484,15 @@ class TestEngineRestartVerifyOrRefuse(unittest.TestCase):
     def test_proxy_restart_reports_dispatch_failed_when_nothing_dispatches(self):
         from unittest.mock import patch, MagicMock
         import sm_proxy_control as pc
+        import sm_restart_log as srl
+        # ISOLATION: proxy_restart() writes provenance to 7688 before dispatch. Mock it
+        # so the test never mutates the live restart ledger (7688 is up on the dev box).
         with patch.object(pc, "proxy_status", return_value="running"), \
              patch.object(pc, "_call_helper", return_value=False), \
              patch.object(pc, "_ensure_restart_task"), \
-             patch.object(pc.subprocess, "run", return_value=MagicMock(returncode=1)):
+             patch.object(pc.subprocess, "run", return_value=MagicMock(returncode=1)), \
+             patch.object(srl, "record_restart", return_value={"restart_id": "test", "recorded": False}), \
+             patch.object(srl, "mark_result"):
             self.assertEqual(pc.proxy_restart(), "dispatch-failed")
 
 
