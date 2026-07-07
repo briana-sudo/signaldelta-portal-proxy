@@ -93,34 +93,35 @@ def helper_available() -> bool:
 
 
 def proxy_restart() -> str:
-    """Restart the proxy service and return immediately ('restarting').
+    """Restart the proxy service — VERIFY DISPATCH, refuse if it can't be dispatched (DEF-030).
 
-    PRIMARY: hand off to the always-on SM_ProxyHelper (out-of-tree, survives the
-    proxy dying, works even mid-code-change). FALLBACK: the one-shot scheduled task,
-    if the helper isn't installed yet. Either way the response flushes before the
-    proxy drops, then it comes back with live /sm/readmodel."""
+    The proxy CANNOT verify its own return-to-RUNNING (it dies mid-restart), so the honest
+    contract is: report whether the restart was actually DISPATCHED (helper accepted, or the
+    out-of-tree task launched exit 0) — never a blanket 'restarting'. The CLIENT then verifies
+    completion by polling the commit chip. PRIMARY: the always-on SM_ProxyHelper (out-of-tree).
+    FALLBACK: the one-shot scheduled task. If NEITHER dispatches → 'dispatch-failed'."""
     st = proxy_status()
     if st == "not-installed":
         return "not-installed"
     if _call_helper("/helper/restart"):
-        return "restarting"
-    # fallback — no helper yet: the out-of-tree scheduled task
+        return "restarting"                       # dispatched to the helper (accepted 200/202)
+    # fallback — no helper: the out-of-tree scheduled task; VERIFY it launched (exit 0)
     _ensure_restart_task()
-    subprocess.run(["schtasks", "/Run", "/TN", RESTART_TASK],
-                   capture_output=True, text=True, timeout=_TIMEOUT)
-    return "restarting"
+    r = subprocess.run(["schtasks", "/Run", "/TN", RESTART_TASK],
+                       capture_output=True, text=True, timeout=_TIMEOUT)
+    return "restarting" if r.returncode == 0 else "dispatch-failed"
 
 
 def proxy_stop() -> str:
-    """Stop the service (scheduled, out-of-tree — the surface goes down; the button
-    does not rely on this, Restart is the operation). Idempotent."""
+    """Stop the service (scheduled, out-of-tree). Reports 'restarting' only if the task
+    actually launched (exit 0) — else 'dispatch-failed'. Never fakes a dispatch (DEF-030)."""
     st = proxy_status()
     if st in ("stopped", "stopping", "not-installed"):
         return st
     _ensure_restart_task()  # the task file also carries a stop path if invoked with an arg
-    subprocess.run(["schtasks", "/Run", "/TN", RESTART_TASK],
-                   capture_output=True, text=True, timeout=_TIMEOUT)
-    return "restarting"
+    r = subprocess.run(["schtasks", "/Run", "/TN", RESTART_TASK],
+                       capture_output=True, text=True, timeout=_TIMEOUT)
+    return "restarting" if r.returncode == 0 else "dispatch-failed"
 
 
 def proxy_start() -> str:

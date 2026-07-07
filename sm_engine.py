@@ -15,13 +15,20 @@ or resolves a gate. (Same `require_operator_identity` auth as every other /sm/*.
 """
 from __future__ import annotations
 
+import json as _json
 import subprocess
+import time as _time
+from pathlib import Path as _Path
+from typing import Any, Callable
 
 # HARDCODED — the ONLY service this module can address. No env override, no default
 # to any other service. Changing the target requires editing this line (a code +
 # review change), not flipping an env var or passing an argument.
 DISCOVERY_SERVICE = "SignalDeltaDiscovery"
 _TIMEOUT = 20
+# the discovery worker's OWN heartbeat — read-only; how a restart is VERIFIED (a new pid),
+# never assumed. Reading it grants NO service-control capability (deny-by-construction holds).
+_STATE_FILE = _Path(r"C:\SignalDelta_Local\searchmaster\state\engine_service.json")
 
 
 def _sc(action: str) -> subprocess.CompletedProcess:
@@ -57,54 +64,105 @@ def engine_status() -> str:
     return classify_state((out.stdout or "") + (out.stderr or ""))
 
 
+def _worker_state() -> dict[str, Any]:
+    """The discovery worker's OWN heartbeat (pid + running commit) — how a restart is VERIFIED
+    (a NEW pid + advanced stamp), not assumed. Read-only; {} on any read failure."""
+    try:
+        d = _json.loads(_STATE_FILE.read_text(encoding="utf-8")) or {}
+        return {"pid": d.get("pid"), "commit": d.get("commit")}
+    except Exception:
+        return {"pid": None, "commit": None}
+
+
+def _wait_until(pred: Callable[[], bool], timeout_s: float, poll_s: float = 0.5) -> bool:
+    """Poll pred() until true or the budget runs out. Bounded so a hung service REFUSES
+    (returns False) rather than hanging the request forever."""
+    left = timeout_s
+    while left > 0:
+        if pred():
+            return True
+        _time.sleep(poll_s)
+        left -= poll_s
+    return pred()
+
+
 def engine_start() -> str:
-    """Start the discovery service (idempotent). Returns the resulting status."""
+    """Start the discovery service and VERIFY it reaches RUNNING (bounded) — returns the
+    SETTLED status, not a mid-flight START_PENDING guess (DEF-030)."""
     st = engine_status()
     if st == "not-installed":
         return "not-installed"
-    if st in ("running", "starting"):
+    if st == "running":
         return st
     try:
-        _sc("start")                          # returns immediately with START_PENDING
+        _sc("start")
     except Exception:
         return "unknown"
+    _wait_until(lambda: engine_status() == "running", 15)
     return engine_status()
 
 
 def engine_stop() -> str:
-    """Stop the discovery service cleanly (NSSM → graceful shutdown). Idempotent."""
+    """Stop the discovery service and VERIFY it reaches STOPPED (bounded) — the SETTLED
+    status, not a mid-flight STOP_PENDING guess (DEF-030)."""
     st = engine_status()
     if st == "not-installed":
         return "not-installed"
-    if st in ("stopped", "stopping"):
+    if st == "stopped":
         return st
     try:
         _sc("stop")
     except Exception:
         return "unknown"
+    _wait_until(lambda: engine_status() in ("stopped", "not-installed"), 15)
     return engine_status()
 
 
-def engine_restart() -> str:
-    """Restart the discovery service to LOAD CURRENT CODE (a stale worker → fresh). Runs in
-    a background thread so the HTTP response returns before the cycle finishes; the button
-    polls status back to 'running'. HARD-PINNED by construction: every service action here
-    goes through _sc(), whose service name is the DISCOVERY_SERVICE constant — there is no
-    code path in this module that can name SignalDeltaEngine (the trading engine)."""
-    import threading
-    import time
+def _result(ok: bool, status: str, hop: str | None, reason: str | None,
+            before: dict, after: dict | None = None) -> dict[str, Any]:
+    after = after or {}
+    return {"ok": ok, "status": status, "hop": hop, "reason": reason,
+            "old_pid": before.get("pid"), "new_pid": after.get("pid"),
+            "old_commit": before.get("commit"), "new_commit": after.get("commit"),
+            "service": DISCOVERY_SERVICE, "action": "restart"}
 
-    def _do():
-        try:
-            _sc("stop")
-            for _ in range(20):                   # wait for STOPPED before start (max ~10s)
-                if engine_status() in ("stopped", "not-installed"):
-                    break
-                time.sleep(0.5)
-            _sc("start")
-        except Exception:
-            pass
+
+def engine_restart() -> dict[str, Any]:
+    """VERIFY-OR-REFUSE restart (DEF-030). Cycle SignalDeltaDiscovery and CONFIRM the worker
+    actually re-spawned (a NEW pid) before reporting success — never 'restarting' on hope.
+    Returns {ok, status, hop, reason, old_pid, new_pid, old_commit, new_commit, service}.
+    The proxy stays alive throughout (it cycles a DIFFERENT service), so it CAN verify — this
+    is NOT the proxy-self-restart case. Still hard-pinned to DISCOVERY_SERVICE: every _sc()
+    call names the constant; no code path here can name SignalDeltaEngine (trading)."""
     if engine_status() == "not-installed":
-        return "not-installed"
-    threading.Thread(target=_do, daemon=True).start()
-    return "restarting"
+        return _result(False, "not-installed", "install",
+                       "SignalDeltaDiscovery is not installed — run Setup Discovery once.", {})
+    before = _worker_state()
+
+    # HOP 1 — STOP, verified it reaches STOPPED
+    try:
+        r = _sc("stop")
+    except Exception as e:
+        return _result(False, engine_status(), "stop", f"sc stop raised: {type(e).__name__}: {e}", before)
+    if not _wait_until(lambda: engine_status() in ("stopped", "not-installed"), 12):
+        return _result(False, engine_status(), "stop",
+                       f"service did not reach STOPPED within 12s "
+                       f"(sc stop exit {r.returncode}: {(r.stderr or r.stdout or '').strip()[:140]})", before)
+
+    # HOP 2 — START, verified it reaches RUNNING
+    try:
+        r2 = _sc("start")
+    except Exception as e:
+        return _result(False, engine_status(), "start", f"sc start raised: {type(e).__name__}: {e}", before)
+    if not _wait_until(lambda: engine_status() == "running", 20):
+        return _result(False, engine_status(), "start",
+                       f"service did not reach RUNNING within 20s "
+                       f"(sc start exit {r2.returncode}: {(r2.stderr or r2.stdout or '').strip()[:140]})", before)
+
+    # HOP 3 — the WORKER actually re-spawned: a NEW pid in the heartbeat (not the old one)
+    if not _wait_until(lambda: _worker_state().get("pid") not in (None, before.get("pid")), 20):
+        return _result(False, "running", "cycle",
+                       f"service reports RUNNING but the worker pid is still {before.get('pid')} — "
+                       f"it did not re-spawn (stale heartbeat / start was a no-op).", before, _worker_state())
+
+    return _result(True, "running", None, None, before, _worker_state())

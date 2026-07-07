@@ -360,7 +360,8 @@ class TestEnginePowerSwitch(unittest.TestCase):
         import sm_engine
         from unittest.mock import patch
         with patch.object(sm_engine, "engine_status", return_value="not-installed"):
-            self.assertEqual(sm_engine.engine_restart(), "not-installed")
+            r = sm_engine.engine_restart()               # DEF-030: now a structured verify result
+            self.assertFalse(r["ok"]); self.assertEqual(r["status"], "not-installed")
 
 
 class TestBranchIsolationAliasHygiene(unittest.TestCase):
@@ -419,6 +420,75 @@ class TestFaithfulRecipeBinding(unittest.TestCase):
                                             "extend the window to 2006", "V-015-TOM-FULL")
         self.assertFalse(ok)                              # not a re-test of THIS surface
         self.assertIn("not a re-test", why.lower())
+
+
+class TestEngineRestartVerifyOrRefuse(unittest.TestCase):
+    """DEF-030: engine_restart must CONFIRM the worker re-spawned (a new pid) before
+    reporting ok — never 'restarting' on hope. Each failing hop is named."""
+    @staticmethod
+    def _seq(values):
+        # returns each value in order, then REPEATS the last (call count is timing-dependent,
+        # so a fixed-length side_effect would StopIteration on the result/return-path reads)
+        vals = list(values) or [None]
+        box = {"i": 0}
+        def f(*a, **k):
+            v = vals[min(box["i"], len(vals) - 1)]; box["i"] += 1; return v
+        return f
+
+    def _run(self, statuses, worker_states):
+        from unittest.mock import patch, MagicMock
+        import sm_engine as se
+        cp = MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(se, "_sc", return_value=cp), \
+             patch.object(se, "engine_status", side_effect=self._seq(statuses)), \
+             patch.object(se, "_worker_state", side_effect=self._seq(worker_states)), \
+             patch.object(se, "_wait_until", side_effect=lambda pred, t, poll_s=0.5: pred()):
+            return se.engine_restart()
+
+    def test_clean_cycle_verified_new_pid(self):
+        r = self._run(["running", "stopped", "running"], [{"pid": 100, "commit": "c"}, {"pid": 200, "commit": "c"}])
+        self.assertTrue(r["ok"])
+        self.assertEqual((r["old_pid"], r["new_pid"]), (100, 200))
+        self.assertIsNone(r["hop"])
+
+    def test_stop_hop_refuses_when_service_never_stops(self):
+        r = self._run(["running", "running"], [{"pid": 100, "commit": "c"}])
+        self.assertFalse(r["ok"]); self.assertEqual(r["hop"], "stop")
+
+    def test_start_hop_refuses_when_service_never_runs(self):
+        r = self._run(["running", "stopped", "stopped"], [{"pid": 100, "commit": "c"}])
+        self.assertFalse(r["ok"]); self.assertEqual(r["hop"], "start")
+
+    def test_cycle_hop_refuses_when_pid_unchanged(self):
+        # service reports stopped→running but the worker pid never changed → did NOT re-spawn
+        r = self._run(["running", "stopped", "running"], [{"pid": 100, "commit": "c"}, {"pid": 100, "commit": "c"}])
+        self.assertFalse(r["ok"]); self.assertEqual(r["hop"], "cycle")
+        self.assertIn("100", r["reason"])
+
+    def test_not_installed_refuses(self):
+        r = self._run(["not-installed"], [])
+        self.assertFalse(r["ok"]); self.assertEqual(r["hop"], "install")
+
+    def test_endpoint_refuses_when_worker_stamp_did_not_advance(self):
+        # engine_restart cycled (ok) but the new worker is NOT on disk HEAD → stamp hop
+        from unittest.mock import patch
+        import sm_engine as se
+        with patch.object(se, "engine_restart", return_value={"ok": True, "status": "running", "hop": None,
+                          "reason": None, "old_pid": 1, "new_pid": 2, "old_commit": "old", "new_commit": "old",
+                          "service": "SignalDeltaDiscovery", "action": "restart"}), \
+             patch.object(sm_proxy, "_engine_tree_commit", return_value="new"):
+            res = sm_proxy.sm_engine_restart()
+        self.assertFalse(res["ok"]); self.assertEqual(res["hop"], "stamp")
+        self.assertIn("new", res["reason"])
+
+    def test_proxy_restart_reports_dispatch_failed_when_nothing_dispatches(self):
+        from unittest.mock import patch, MagicMock
+        import sm_proxy_control as pc
+        with patch.object(pc, "proxy_status", return_value="running"), \
+             patch.object(pc, "_call_helper", return_value=False), \
+             patch.object(pc, "_ensure_restart_task"), \
+             patch.object(pc.subprocess, "run", return_value=MagicMock(returncode=1)):
+            self.assertEqual(pc.proxy_restart(), "dispatch-failed")
 
 
 class TestServerSideSecrets(unittest.TestCase):

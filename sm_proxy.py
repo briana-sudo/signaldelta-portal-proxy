@@ -938,11 +938,23 @@ def sm_engine_stop():
 
 @sm_router.post("/engine/restart", dependencies=[Depends(require_operator_identity)])
 def sm_engine_restart():
-    """Restart the DISCOVERY engine to load current code. Hard-pinned by construction to
+    """Restart the DISCOVERY engine to load current code — VERIFY-OR-REFUSE (DEF-030): it
+    confirms the worker re-spawned (new pid) AND advanced to disk HEAD before reporting ok;
+    otherwise it returns ok=false with the named failing hop. Hard-pinned by construction to
     SignalDeltaDiscovery (sm_engine.DISCOVERY_SERVICE) — this path CANNOT name or cycle
     SignalDeltaEngine (the trading engine). No service-name parameter exists."""
     import sm_engine as _e
-    return {"action": "restart", "status": _e.engine_restart(), "service": _e.DISCOVERY_SERVICE}
+    res = _e.engine_restart()
+    # final verify the endpoint CAN do (it has git): the re-spawned worker's stamp advanced
+    # to disk HEAD. If not, the chip would still read stale — say so, don't claim success.
+    if res.get("ok"):
+        head = _engine_tree_commit()
+        new = res.get("new_commit")
+        if head and new and new != head:
+            res.update({"ok": False, "hop": "stamp",
+                        "reason": f"worker re-spawned (pid {res.get('new_pid')}) but is on {new}, "
+                                  f"not disk HEAD {head} — stamp-on-start failed; the chip stays stale."})
+    return res
 
 
 # Controls the SignalDeltaProxy Windows SERVICE (the surface the portal talks to).
