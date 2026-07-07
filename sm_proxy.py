@@ -32,7 +32,7 @@ import os
 import re as _re
 from typing import Any, Callable
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from sm_cypher_allowlist import is_read_shaped
@@ -1040,22 +1040,67 @@ def _git_update() -> dict[str, Any]:
     return out
 
 
-@sm_router.post("/proxy/update-restart", dependencies=[Depends(require_operator_identity)])
-def sm_proxy_update_restart():
+async def _restart_context(request: Request) -> tuple[str, str]:
+    """(trigger, client_ip) for restart provenance. trigger comes from the request
+    body ('manual' on an operator click, 'auto' if a machine ever fires it) and
+    defaults to 'unknown' so any FUTURE non-click path is caught as un-attributed
+    rather than mislabelled manual. client_ip prefers the forwarded client (set by
+    cloudflared and preserved by SM_ProxyFront) over the local hop."""
+    trigger = "unknown"
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and isinstance(body.get("trigger"), str):
+            trigger = body["trigger"]
+    except Exception:
+        pass
+    xff = request.headers.get("x-forwarded-for") or ""
+    client_ip = (xff.split(",")[0].strip() if xff
+                 else (request.client.host if request.client else ""))
+    return trigger, client_ip
+
+
+@sm_router.post("/proxy/update-restart")
+async def sm_proxy_update_restart(request: Request,
+                                  identity: str = Depends(require_operator_identity)):
     """UPDATE & RESTART — the fix for 'restart != deploy'. Fast-forwards the service
     tree to the deploy branch FIRST, then restarts via the helper, so the running
     process picks up the latest code (not just cycles the old code). The topbar's
-    running_commit reflects the new commit once it comes back."""
+    running_commit reflects the new commit once it comes back. Every restart is logged
+    to 7688 with its actor + manual/auto trigger (sm_restart_log)."""
+    trigger, client_ip = await _restart_context(request)
+    from_commit = _git_short("HEAD")                 # running commit BEFORE the ff
     update = _git_update()
-    return {"action": "update-restart", "update": update, "status": proxy_restart()}
+    to_commit = (update.get("tree_commit") if isinstance(update, dict) else None) or _git_short("HEAD")
+    status = proxy_restart(source="update-restart", actor=identity, trigger=trigger,
+                           client_ip=client_ip, from_commit=from_commit or "",
+                           to_commit=to_commit or "")
+    return {"action": "update-restart", "update": update, "status": status}
 
 
-@sm_router.post("/proxy/restart", dependencies=[Depends(require_operator_identity)])
-def sm_proxy_restart():
+@sm_router.post("/proxy/restart")
+async def sm_proxy_restart(request: Request,
+                           identity: str = Depends(require_operator_identity)):
     """Cleanly restart the proxy service via an out-of-tree scheduled task. Returns
     immediately with 'restarting'; the service cycles and comes back with live
-    /sm/readmodel. (This is the click that makes 'restart the proxy' terminal-free.)"""
-    return {"action": "restart", "status": proxy_restart()}
+    /sm/readmodel. (This is the click that makes 'restart the proxy' terminal-free.)
+    Logged to 7688 with its actor + trigger (sm_restart_log)."""
+    trigger, client_ip = await _restart_context(request)
+    head = _git_short("HEAD") or ""
+    status = proxy_restart(source="restart", actor=identity, trigger=trigger,
+                           client_ip=client_ip, from_commit=head, to_commit=head)
+    return {"action": "restart", "status": status}
+
+
+def stamp_return_on_start() -> dict[str, Any]:
+    """Called from the app lifespan on STARTUP: close the most-recent still-open
+    ProxyRestartNode with came_back_at + the commit now running (stamp-on-start,
+    DEF-027 for the proxy). Best-effort — never blocks startup, never raises."""
+    try:
+        import sm_restart_log
+        running = _git_short("HEAD") or ""
+        return sm_restart_log.stamp_return(running)
+    except Exception as e:
+        return {"stamped": None, "reason": str(e)[:200]}
 
 
 @sm_router.post("/proxy/stop", dependencies=[Depends(require_operator_identity)])

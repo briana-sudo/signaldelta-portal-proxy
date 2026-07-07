@@ -92,24 +92,49 @@ def helper_available() -> bool:
         return False
 
 
-def proxy_restart() -> str:
+def proxy_restart(*, source: str = "restart", actor: str = "unknown",
+                  trigger: str = "unknown", client_ip: str = "",
+                  from_commit: str = "", to_commit: str = "") -> str:
     """Restart the proxy service — VERIFY DISPATCH, refuse if it can't be dispatched (DEF-030).
 
     The proxy CANNOT verify its own return-to-RUNNING (it dies mid-restart), so the honest
     contract is: report whether the restart was actually DISPATCHED (helper accepted, or the
     out-of-tree task launched exit 0) — never a blanket 'restarting'. The CLIENT then verifies
     completion by polling the commit chip. PRIMARY: the always-on SM_ProxyHelper (out-of-tree).
-    FALLBACK: the one-shot scheduled task. If NEITHER dispatches → 'dispatch-failed'."""
+    FALLBACK: the one-shot scheduled task. If NEITHER dispatches → 'dispatch-failed'.
+
+    PROVENANCE: every restart is logged (actor + trigger + from→to commit) to 7688 BEFORE
+    dispatch, then stamped with the outcome; the fresh process closes the loop on startup
+    (sm_restart_log.stamp_return). Provenance is best-effort — it never blocks a restart."""
     st = proxy_status()
     if st == "not-installed":
         return "not-installed"
-    if _call_helper("/helper/restart"):
-        return "restarting"                       # dispatched to the helper (accepted 200/202)
-    # fallback — no helper: the out-of-tree scheduled task; VERIFY it launched (exit 0)
-    _ensure_restart_task()
-    r = subprocess.run(["schtasks", "/Run", "/TN", RESTART_TASK],
-                       capture_output=True, text=True, timeout=_TIMEOUT)
-    return "restarting" if r.returncode == 0 else "dispatch-failed"
+
+    rid = None
+    try:                                               # provenance is never load-bearing
+        import sm_restart_log
+        rec = sm_restart_log.record_restart(
+            source=source, actor=actor, trigger=trigger, client_ip=client_ip,
+            from_commit=from_commit, to_commit=to_commit)
+        rid = rec.get("restart_id")
+    except Exception:
+        pass
+
+    dispatched = _call_helper("/helper/restart")       # PRIMARY: out-of-tree helper
+    if not dispatched:
+        # fallback — no helper: the out-of-tree scheduled task; VERIFY it launched (exit 0)
+        _ensure_restart_task()
+        r = subprocess.run(["schtasks", "/Run", "/TN", RESTART_TASK],
+                           capture_output=True, text=True, timeout=_TIMEOUT)
+        dispatched = (r.returncode == 0)
+
+    if rid:
+        try:
+            import sm_restart_log
+            sm_restart_log.mark_result(rid, "dispatched" if dispatched else "dispatch-failed")
+        except Exception:
+            pass
+    return "restarting" if dispatched else "dispatch-failed"
 
 
 def proxy_stop() -> str:

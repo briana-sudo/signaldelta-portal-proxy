@@ -13,6 +13,7 @@ and has NO trade path. Stdlib only (fast start, no venv coupling).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -26,6 +27,26 @@ HELPER_PORT = int(os.environ.get("SM_HELPER_PORT", "8199"))
 HELPER_TOKEN = os.environ.get("SM_HELPER_TOKEN")            # shared with the proxy; set by setup
 NSSM = os.environ.get("SM_NSSM_PATH", r"C:\SignalDelta_Local\tools\nssm.exe")
 _TIMEOUT = 25
+
+
+def _log(msg: str) -> None:
+    """Timestamped line to stdout (nssm captures it to sm_helper.log). The helper used
+    to log NOTHING, so a restart driven through it left no actor trace anywhere — this
+    closes that blind spot. Never logs the token, only a short non-reversible
+    fingerprint of it, so the log is safe to read. ASCII-only + crash-proof: nssm's
+    stdout is cp1252, so logging must never raise UnicodeEncodeError on a stray char."""
+    try:
+        print(f"[sm-helper] {time.strftime('%Y-%m-%dT%H:%M:%S%z')} {msg}", flush=True)
+    except Exception:
+        pass
+
+
+def _tok_fingerprint(raw: str | None) -> str:
+    """First 8 hex of sha256(token) — proves WHICH credential called without ever
+    logging the credential. 'none' if unauthenticated (localhost-trust mode)."""
+    if not raw:
+        return "none"
+    return hashlib.sha256(raw.encode()).hexdigest()[:8]
 
 
 def _sc(*args: str) -> subprocess.CompletedProcess:
@@ -63,12 +84,15 @@ def _do_restart() -> None:
         if os.path.exists(NSSM):
             r = subprocess.run([NSSM, "restart", PROXY_SERVICE], capture_output=True, text=True, timeout=60)
             done = (r.returncode == 0)
+            _log(f"restart dispatched via nssm returncode={r.returncode}")
         if not done:                                   # nssm unavailable/unprivileged → SCM stop+start
+            _log("nssm restart unavailable/failed — falling back to sc stop+start")
             _sc("stop", PROXY_SERVICE)
             time.sleep(3)
             _sc("start", PROXY_SERVICE)
-    except Exception:
-        pass
+            _log("restart dispatched via sc stop+start")
+    except Exception as e:
+        _log(f"restart dispatch RAISED: {str(e)[:160]}")
 
 
 def _do_start() -> None:
@@ -114,10 +138,16 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
         p = self.path.rstrip("/")
+        caller = self.client_address[0] if self.client_address else "?"
+        fp = _tok_fingerprint(
+            self.headers.get("X-Helper-Token")
+            or ((self.headers.get("Authorization") or "")[7:] or None))
         if p == "/helper/restart":
+            _log(f"ACCEPTED /helper/restart from {caller} token={fp} -> cycling {PROXY_SERVICE}")
             threading.Thread(target=_do_restart, daemon=True).start()
             return self._send(202, {"action": "restart", "status": "restarting", "by": "SM_ProxyHelper"})
         if p == "/helper/start":
+            _log(f"ACCEPTED /helper/start from {caller} token={fp} -> starting {PROXY_SERVICE}")
             threading.Thread(target=_do_start, daemon=True).start()
             return self._send(202, {"action": "start", "status": "starting", "by": "SM_ProxyHelper"})
         return self._send(404, {"error": "not found"})

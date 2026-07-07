@@ -144,6 +144,17 @@ async def lifespan(app: FastAPI):
         _driver.verify_connectivity()
     except Exception as e:
         print(f"[proxy] WARNING: Neo4j connectivity check failed: {e}", file=sys.stderr)
+    # RESTART PROVENANCE (stamp-on-start): close the most-recent open ProxyRestartNode
+    # with the commit we came back on, so every restart's loop is closed by the fresh
+    # process (mirrors the engine's DEF-027). Best-effort — never blocks startup.
+    try:
+        from sm_proxy import stamp_return_on_start
+        stamped = stamp_return_on_start()
+        if stamped and stamped.get("id"):
+            print(f"[proxy] restart provenance: closed {stamped['id']} "
+                  f"(actor={stamped.get('actor')}, trigger={stamped.get('trigger')})", flush=True)
+    except Exception as e:
+        print(f"[proxy] restart provenance stamp-on-start skipped: {e}", file=sys.stderr)
     yield
     if _driver is not None:
         _driver.close()
