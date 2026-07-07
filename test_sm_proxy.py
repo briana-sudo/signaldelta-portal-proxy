@@ -21,6 +21,38 @@ from sm_proxy import (
 )
 from sm_secrets import SecretsStore
 
+# TEST ISOLATION (module-wide): engine_restart() appends every hop to a PRODUCTION
+# trace file (sm_engine._TRACE_FILE = searchmaster/state/engine_restart_trace.log). The
+# module contract is "no live" state — but the engine-restart tests exercise the real
+# _trace() and were polluting that file with mock pids, which then misled a live restart
+# post-mortem. Redirect the trace to a throwaway temp file for the whole module so NO
+# engine-restart test (present or future) can write the production trace.
+import os as _os
+import tempfile as _tempfile
+from pathlib import Path as _Path
+import sm_engine as _sm_engine
+
+_ORIG_TRACE_FILE = None
+_TMP_TRACE = None
+
+
+def setUpModule():
+    global _ORIG_TRACE_FILE, _TMP_TRACE
+    _ORIG_TRACE_FILE = _sm_engine._TRACE_FILE
+    fd, path = _tempfile.mkstemp(prefix="engine_trace_test_", suffix=".log")
+    _os.close(fd)
+    _TMP_TRACE = _Path(path)
+    _sm_engine._TRACE_FILE = _TMP_TRACE          # _trace() reads this global at call time
+
+
+def tearDownModule():
+    _sm_engine._TRACE_FILE = _ORIG_TRACE_FILE
+    try:
+        if _TMP_TRACE and _TMP_TRACE.exists():
+            _TMP_TRACE.unlink()
+    except Exception:
+        pass
+
 
 class TestAllowlistAdmitsReadShaped(unittest.TestCase):
     def test_admits(self):
