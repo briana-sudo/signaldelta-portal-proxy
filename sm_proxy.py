@@ -163,6 +163,11 @@ class SMLessonActionRequest(BaseModel):
     lesson_id: str
 
 
+class SMProposalActionRequest(BaseModel):
+    proposal_id: str
+    decision: str                                 # 'approve' | 'dismiss'
+
+
 class SMTerminusLLMRequest(BaseModel):
     system: str
     user: str
@@ -459,6 +464,10 @@ def sm_readmodel():
             # CLASS MONITORS (one row per revival class) — the Timeline renders the table;
             # reading_live carries the honesty law (an unwired feed shows 'no live feed').
             "monitors": rows("SMMonitor", order=" ORDER BY n.revival_class"),
+            # MONITOR/SWEEP PROPOSALS — the durable, operator-readable records that are the
+            # SINGLE authority: Needs-your-attention surfaces PENDING ones, the analyst
+            # grounds on them, the Timeline badge DERIVES its count from them (never stored).
+            "proposals": rows("SMProposal", order=" ORDER BY n.created_at DESC"),
             "scan_history": rows("SMScan", order=" ORDER BY n.at DESC"),
             # every run (probe / component / re-terminus) with its stage progress,
             # result, disposition record + report version history — the Run Room source
@@ -916,6 +925,25 @@ def sm_lesson_unbank(req: SMLessonActionRequest):
     history kept). The inverse of Bank."""
     import sm_lessons
     return sm_lessons.unbank(req.lesson_id)
+
+
+@sm_router.get("/proposals", dependencies=[Depends(require_operator_identity)])
+def sm_proposals_list():
+    """PENDING monitor/sweep recheck proposals — the durable records Needs-your-attention
+    surfaces (also in /sm/readmodel as the 'proposals' slice)."""
+    import sm_proposals
+    return {"proposals": sm_proposals.pending()}
+
+
+@sm_router.post("/proposal/resolve", dependencies=[Depends(require_operator_identity)])
+def sm_proposal_resolve(req: SMProposalActionRequest,
+                        identity: str = Depends(require_operator_identity)):
+    """OPERATOR gate on a recheck proposal: approve or dismiss. Sets the durable
+    SMProposal status (APPROVED | DISMISSED) with the actor — it does NOT itself run a
+    recheck (running is a separate gated search decision); it records the operator's
+    decision so the surface stops proposing and the choice is auditable."""
+    import sm_proposals
+    return sm_proposals.resolve(req.proposal_id, req.decision, actor=identity)
 
 
 # --- DISCOVERY-ENGINE POWER SWITCH (start/stop/status of the discovery service) ---
