@@ -456,6 +456,9 @@ def sm_readmodel():
             "deployed": rows("SMDeployedSignal"),
             # revival monitor state + recheck-scan history (the Timeline's live source)
             "watches": rows("SMWatch"),
+            # CLASS MONITORS (one row per revival class) — the Timeline renders the table;
+            # reading_live carries the honesty law (an unwired feed shows 'no live feed').
+            "monitors": rows("SMMonitor", order=" ORDER BY n.revival_class"),
             "scan_history": rows("SMScan", order=" ORDER BY n.at DESC"),
             # every run (probe / component / re-terminus) with its stage progress,
             # result, disposition record + report version history — the Run Room source
