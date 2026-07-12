@@ -1147,13 +1147,21 @@ QUERIES = {
     "storm_date_layers": """
         MATCH (n:StormNode:AdCluster {storm_date: $date})
         WHERE NOT n:KCCNode AND NOT n:KTMNode AND NOT n:TradeNode
+          AND coalesce(n.superseded, false) = false
         RETURN n.peril AS peril, n.circle_count AS circle_count,
                n.cover_area_sqmi AS cover_area_sqmi,
                n.gated_swath_area_sqmi AS swath_area_sqmi,
                n.zip_union_area_sqmi AS zip_union_area_sqmi,
                n.circles_json AS circles_json, n.swath_json AS swath_json,
                n.evidence_json AS evidence_json,
-               n.coverage_zone AS coverage_zone, n.in_geofence AS in_geofence
+               n.coverage_zone AS coverage_zone, n.in_geofence AS in_geofence,
+               // additive (2026-07-12) — portal chips: tornado gate verdict + miss-recovery review
+               // flag + the deferred pricing-incomplete flag. Absent on older nodes -> coalesced.
+               coalesce(n.fundable, false) AS fundable,
+               n.not_promotable_reason AS not_promotable_reason,
+               coalesce(n.miss_recovery, false) AS miss_recovery,
+               coalesce(n.passes_incomplete, false) AS passes_incomplete,
+               n.exposure_basis AS exposure_basis
         ORDER BY peril, coverage_zone
     """,
 }
