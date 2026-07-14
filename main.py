@@ -663,6 +663,41 @@ def solve_geometry(req: SolveGeometryReq):
     return _run_engine_cli("solve-geometry", req.dict(), timeout=240)
 
 
+# ── PER-ADDRESS STORM REPORT + OPERATOR WATCHLIST (2026-07-14) ───────────────────────────────────
+# All three are WRITE-token gated: the report SENDS AN EMAIL and the watchlist MUTATES graph state, so
+# neither may ride the read token. v1 is operator-facing — the report goes to the operator, and the
+# watchlist never contacts a homeowner.
+class AddressReportReq(BaseModel):
+    address: str
+    email: str | None = None
+    roof_covering: str | None = None
+    asof: str | None = None
+
+
+class WatchlistReq(BaseModel):
+    address: str
+    roof_install_year: int | None = None
+    note: str = ""
+    actor: str = "operator"
+
+
+@app.post("/address_report", dependencies=[Depends(require_write_bearer)])
+def address_report(req: AddressReportReq):
+    # geocode -> build -> PDF (only if it qualifies) -> email. A slow-ish path (report fetches +
+    # PDF render), so it gets a longer timeout than a spend call.
+    return _run_engine_cli("address-report", req.dict(), timeout=180)
+
+
+@app.post("/watchlist_add", dependencies=[Depends(require_write_bearer)])
+def watchlist_add(req: WatchlistReq):
+    return _run_engine_cli("watchlist-add", req.dict())
+
+
+@app.post("/watchlist_remove", dependencies=[Depends(require_write_bearer)])
+def watchlist_remove(req: WatchlistReq):
+    return _run_engine_cli("watchlist-remove", req.dict())
+
+
 @app.post("/spend_approve", dependencies=[Depends(require_write_bearer)])
 def spend_approve(req: SpendApproveReq):
     return _run_engine_cli("spend-approve", req.dict())        # the single gate (one record)
