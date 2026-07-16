@@ -698,6 +698,52 @@ def watchlist_remove(req: WatchlistReq):
     return _run_engine_cli("watchlist-remove", req.dict())
 
 
+# ── STAGE-2 PROMOTION LANE (2026-07-16) ─────────────────────────────────────────────────────────
+# The ad-spend human gate. These shipped in the portal at 4ce8567 (Jul 10) but had NO route here and
+# no Netlify function, so the Approve / "Send promoted" buttons never worked (CORS-less 404 ->
+# "Failed to fetch"); the graph holds zero promoted solves as a result. active_promotion is READ-ONLY
+# and rides the read token; promote_solve MUTATES graph state (and a promoted solve is frozen
+# forever) and send_promoted selects the geometry the push lane consumes, so both are write-gated.
+class ActivePromotionReq(BaseModel):
+    date: str
+    peril: str = "hail"
+
+
+class PromoteSolveReq(BaseModel):
+    date: str
+    peril: str = "hail"
+    hail_floor: float = 1.80
+    spend_cap: float | None = None
+    objective: str = "dial"
+    solve_id: str | None = None
+    actor: str = "operator"
+
+
+class SendPromotedReq(BaseModel):
+    date: str
+    peril: str = "hail"
+
+
+@app.post("/active_promotion", dependencies=[Depends(require_bearer)])
+def active_promotion(req: ActivePromotionReq):
+    return _run_engine_cli("active-promotion", req.dict())     # READ-ONLY (writes nothing)
+
+
+@app.post("/promote_solve", dependencies=[Depends(require_write_bearer)])
+def promote_solve(req: PromoteSolveReq):
+    # Promoting the CURRENTLY DIALED solve may have to solve+persist first (the portal's
+    # solve-geometry runs persist=False), which tries the resident KCCSolveEngine (~3s warm) and
+    # falls back to the ~200s cold path — so this takes solve_geometry's longer timeout, not the
+    # default. Never touches Google.
+    return _run_engine_cli("promote-solve", req.dict(), timeout=240)
+
+
+@app.post("/send_promoted", dependencies=[Depends(require_write_bearer)])
+def send_promoted(req: SendPromotedReq):
+    # Selects the active promoted geometry as the push lane's input. No Google Ads account writes.
+    return _run_engine_cli("send-promoted", req.dict())
+
+
 @app.post("/spend_approve", dependencies=[Depends(require_write_bearer)])
 def spend_approve(req: SpendApproveReq):
     return _run_engine_cli("spend-approve", req.dict())        # the single gate (one record)
